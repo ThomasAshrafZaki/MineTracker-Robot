@@ -1,0 +1,114 @@
+{
+  "profile": "laptop_v4",
+  "source": "0",
+  "flip": false,
+
+  "yolo": {
+    "model_path": "yolov8n.pt",
+    "conf": 0.60,
+    "imgsz": 320,
+    "device": "cpu",
+    "every_n_frames": 3
+  },
+
+  "frame": {
+    "resize_w": 640,
+    "resize_h": 360
+  },
+
+  "roi": {
+    "lane_width_pct": 70,
+    "top_narrow_pct": 10,
+    "y_top_pct": 35,
+    "stop_line_pct": 90
+  },
+
+  "filters": {
+    "min_stop_box_area": 1400,
+    "max_stop_box_area_ratio": 0.40,
+    "max_stop_box_height_ratio": 0.70
+  },
+
+  "temporal": {
+    "stop_confirm_frames": 3,
+    "clear_frames_to_reset": 4
+  },
+
+  "scoring": {
+    "center_weight_enabled": true,
+    "center_weight_power": 1.8
+  },
+
+  "tri_roi": {
+    "enabled": true,
+    "left_right_split_pct": 33
+  },
+
+  "sign_detector": {
+    "enabled": false,
+    "min_sign_area": 800
+  },
+
+  "pit_detector": {
+    "enabled": true,
+    "dark_threshold": 40,
+    "min_pit_area_pct": 0.08
+  },
+
+  "dynamic_roi": {
+    "enabled": false,
+    "max_shift_px": 40
+  },
+
+  "adaptive_conf": {
+    "enabled": true,
+    "min_conf": 0.35,
+    "max_conf": 0.80,
+    "update_every_frames": 30
+  },
+
+  "watchdog": {
+    "timeout_s": 2.0
+  },
+
+  "serial": {
+    "enabled": false,
+    "rx_enabled": false,
+    "port": "/dev/ttyACM0",
+    "baud": 115200,
+    "send_proceed": true,
+    "throttle_ms": 60
+  },
+
+  "ultrasonic": {
+    "enabled": false,
+    "emergency_stop_cm": 25.0,
+    "warning_cm": 60.0,
+    "max_age_ms": 600,
+    "fail_safe_stop_if_stale": false
+  },
+
+  "avoidance": {
+    "enabled": true,
+    "cooldown_ms": 250,
+    "prefer": "AUTO"
+  },
+
+  "control": {
+    "auto_enabled": true,
+    "manual_mode_passthrough": false,
+    "default_speed": 120
+  },
+
+  "metrics": {
+    "false_stop_ultra_far_cm": 200.0
+  },
+
+  "logging": {
+    "enabled": true,
+    "csv_path": "logs/run_log.csv",
+    "save_snapshots": true,
+    "snapshots_dir": "logs/snaps",
+    "snapshot_every_n": 30
+  }
+}

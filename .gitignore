@@ -1,0 +1,26 @@
+# --- Python Specific ---
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+.env
+
+# --- Arduino/Embedded Specific ---
+# بنشيل ملفات الـ build والملفات المؤقتة للأردوينو
+build/
+bin/
+obj/
+*.elf
+*.hex
+
+# --- OS Specific ---
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# --- IDE Specific ---
+.vscode/
+.idea/
+*.swp
