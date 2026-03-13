@@ -1,7 +1,4 @@
-<<<<<<< HEAD
-# MineTracker-Robot
-Autonomous land mine detection robot using YOLOv8 vision 
-=======
+
 #  Autonomous Mine-Clearing Robot 
 ### *Empowering Demining Teams with AI & Robotics*
 
@@ -81,4 +78,4 @@ We are building this to save lives. If you have experience in **Path Planning**,
 
 ##  License
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
->>>>>>> c684e94... Initial commit: Professional structure with .gitignore
+
