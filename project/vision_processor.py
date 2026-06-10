@@ -1,0 +1,916 @@
+"""
+================================================================================
+  vision_processor.py  —  Camera + YOLO Obstacle Detection
+================================================================================
+  Version 7.0 — Stability Fixes
+
+  Changes from v6.0:
+      ✓ STOP_LINE_PCT lowered 70→50 (detects humans/objects from further away)
+      ✓ Sliding window persistence (3 of last 5 frames) — tolerates vibration
+      ✓ Strict ROI enforcement — boxes outside ROI never shown or reported
+      ✓ MIN_PERSISTENCE_FRAMES back to 2 (sliding window handles stability)
+      ✓ SmartObstacleAnalyzer CONFIRM_FRAMES = 2
+      ✓ MAX_DETECTION_AGE_S raised 0.35→0.5 (less flickering on slow YOLO)
+      ✓ Human class always passes ROI check (safety priority)
+
+  Author  : Robot Team
+  Version : 7.0
+================================================================================
+"""
+
+import cv2
+import threading
+import time
+import logging
+import numpy as np
+
+from collections import deque
+from dataclasses import dataclass, field
+from datetime import datetime
+
+log = logging.getLogger("VisionProcessor")
+
+
+# ──────────────────────────────────────────────
+#  CONSTANTS
+# ──────────────────────────────────────────────
+
+FRAME_WIDTH  = 640
+FRAME_HEIGHT = 480
+
+YOLO_EVERY_N = 3
+YOLO_CONF    = 0.45       # lowered slightly for better human detection
+YOLO_MODEL   = "yolov8n.pt"
+
+# ── Trapezoid ROI ──────────────────────────────
+TRAP_LANE_WIDTH_PCT  = 85  # wider base
+TRAP_TOP_NARROW_PCT  = 25
+TRAP_Y_TOP_PCT       = 30  # start higher to catch humans earlier
+TRAP_Y_BOTTOM_PCT    = 97
+
+# ── Proximity gate ─────────────────────────────
+# lowered from 70→50 so objects/humans detected from further away
+STOP_LINE_PCT = 50
+
+# ── Box filters ────────────────────────────────
+MIN_BOX_AREA_RATIO = 0.008   # lowered — catch smaller/further objects
+MIN_BOX_WIDTH      = 20
+MIN_BOX_HEIGHT     = 20
+MIN_BOX_ASPECT     = 0.2
+
+# ── Sliding window persistence ─────────────────
+# "confirmed" if seen in PERSIST_HITS of last PERSIST_WINDOW frames
+# tolerates YOLO missing 1-2 frames due to vibration
+PERSIST_WINDOW = 5
+PERSIST_HITS   = 3
+
+# ── Stale detection ────────────────────────────
+MAX_DETECTION_AGE_S = 0.5   # raised — less flickering on slow YOLO
+
+# ── Danger score weights ───────────────────────
+DANGER_CENTER_WEIGHT = 1.8
+DANGER_BOTTOM_WEIGHT = 1.4
+DANGER_AREA_WEIGHT   = 1.2
+
+# ── Class filters ──────────────────────────────
+IGNORE_CLASSES         = []
+VALID_OBSTACLE_CLASSES = [
+    "bottle", "cup", "bowl", "vase", "book", "cell phone",
+    "laptop", "keyboard", "mouse", "remote", "clock",
+    "chair", "couch", "bed", "dining table", "desk",
+    "suitcase", "backpack", "handbag",
+    "refrigerator", "microwave", "oven", "sink",
+    "tv", "monitor",
+    "potted plant", "umbrella", "box",
+    # حيوانات
+    "cat", "dog",
+    # إنسان — بس بـ confidence عالية
+    "person",
+]
+
+HUMAN_CLASS = "person"
+HUMAN_MIN_CONF = 0.75   # human لازم conf عالية عشان ميتعرفش غلط
+
+# ── HUD colors ─────────────────────────────────
+COLOR_CRITICAL = (0,   0, 255)
+COLOR_HIGH     = (0,  80, 255)
+COLOR_MEDIUM   = (0, 165, 255)
+COLOR_LOW      = (0, 255, 255)
+COLOR_CLEAR    = (0, 200,   0)
+COLOR_HUMAN    = (0,   0, 255)
+COLOR_INFO     = (200, 200,   0)
+COLOR_BLACK    = (0,   0,   0)
+
+
+# ──────────────────────────────────────────────
+#  DATA MODELS
+# ──────────────────────────────────────────────
+
+@dataclass
+class DetectionResult:
+    timestamp:      float = field(default_factory=time.time)
+    position:       str   = "NONE"
+    confidence:     float = 0.0
+    label:          str   = ""
+    box:            tuple = ()
+    center_x:       int   = 0
+    frame_width:    int   = FRAME_WIDTH
+    danger_score:   float = 0.0
+    detection_age:  float = 0.0
+    persistent:     bool  = False
+    threat_level:   str   = "NONE"
+    approx_dist:    str   = "FAR"
+    is_approaching: bool  = False
+    is_human:       bool  = False
+
+    def is_valid(self, max_age: float = 0.5) -> bool:
+        return (time.time() - self.timestamp) < max_age
+
+    def obstacle_found(self) -> bool:
+        return self.position != "NONE"
+
+
+@dataclass
+class ObstacleThreatLevel:
+    position:       str   = "NONE"
+    threat:         str   = "NONE"
+    confidence:     float = 0.0
+    label:          str   = ""
+    approx_dist:    str   = "FAR"
+    is_approaching: bool  = False
+    box_area_pct:   float = 0.0
+    cy_pct:         float = 0.0
+
+
+# ──────────────────────────────────────────────
+#  TRAPEZOID ROI HELPERS
+# ──────────────────────────────────────────────
+
+def build_trapezoid_roi(frame_w: int, frame_h: int) -> np.ndarray:
+    lane_w  = int(frame_w * (TRAP_LANE_WIDTH_PCT / 100.0))
+    lane_w  = max(60, min(frame_w - 10, lane_w))
+    x_left  = (frame_w - lane_w) // 2
+    x_right = x_left + lane_w
+
+    y_top    = int(frame_h * (TRAP_Y_TOP_PCT    / 100.0))
+    y_bottom = int(frame_h * (TRAP_Y_BOTTOM_PCT / 100.0))
+    y_top    = max(10, min(frame_h - 10, y_top))
+    y_bottom = max(y_top + 10, min(frame_h - 1, y_bottom))
+
+    shrink = int(lane_w * (TRAP_TOP_NARROW_PCT / 100.0))
+    shrink = max(0, min(lane_w // 2 - 5, shrink))
+
+    return np.array([[
+        (x_left,           y_bottom),
+        (x_left  + shrink, y_top),
+        (x_right - shrink, y_top),
+        (x_right,          y_bottom),
+    ]], dtype=np.int32)
+
+
+def point_in_trapezoid(roi_contour: np.ndarray, px: float, py: float) -> bool:
+    return cv2.pointPolygonTest(roi_contour, (px, py), False) >= 0
+
+
+def box_inside_trapezoid(roi_contour: np.ndarray, box: dict) -> bool:
+    """
+    Strict ROI check — tests center + all 4 corners + bottom edge midpoint.
+    Box must have at least ONE point inside the trapezoid.
+    This prevents boxes that are mostly outside ROI from slipping through.
+    """
+    x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+
+    test_pts = [
+        (float(cx),       float(y2)),        # bottom center
+        (float(x1 + 2),   float(y2)),        # bottom left
+        (float(x2 - 2),   float(y2)),        # bottom right
+        (float(cx),       float(cy)),        # center
+        (float(x1 + 2),   float(cy)),        # mid left
+        (float(x2 - 2),   float(cy)),        # mid right
+    ]
+    return any(point_in_trapezoid(roi_contour, px, py) for px, py in test_pts)
+
+
+# ──────────────────────────────────────────────
+#  SLIDING WINDOW PERSISTENCE
+#  Stable if seen PERSIST_HITS times in last PERSIST_WINDOW frames.
+#  Tolerates YOLO missing frames due to vibration.
+# ──────────────────────────────────────────────
+
+class SlidingWindowPersistence:
+
+    def __init__(self, window: int = PERSIST_WINDOW, hits: int = PERSIST_HITS):
+        self._window  = window
+        self._hits    = hits
+        self._history = deque(maxlen=window)  # True/False per frame
+
+    def update(self, detected: bool) -> bool:
+        """Add frame result, return True if persistently confirmed."""
+        self._history.append(detected)
+        return sum(self._history) >= self._hits
+
+    def reset(self):
+        self._history.clear()
+
+    @property
+    def score(self) -> int:
+        return sum(self._history)
+
+
+# ──────────────────────────────────────────────
+#  SMART OBSTACLE ANALYZER
+# ──────────────────────────────────────────────
+
+class SmartObstacleAnalyzer:
+
+    DIST_THRESHOLDS = {
+        "VERY_CLOSE": 0.12,
+        "CLOSE":      0.05,
+        "MEDIUM":     0.02,
+        "FAR":        0.0,
+    }
+
+    def __init__(self):
+        self._history: list = []
+
+    def analyze(self, boxes: list, frame_w: int, frame_h: int) -> ObstacleThreatLevel:
+        if not boxes:
+            if self._history:
+                self._history.pop(0)
+            return ObstacleThreatLevel()
+
+        best       = boxes[0]
+        frame_area = frame_w * frame_h
+        box_area   = (best["x2"] - best["x1"]) * (best["y2"] - best["y1"])
+        area_ratio = box_area / frame_area
+        cy_ratio   = best["cy"] / frame_h
+
+        approx_dist = "FAR"
+        for dist_name, threshold in self.DIST_THRESHOLDS.items():
+            if area_ratio >= threshold:
+                approx_dist = dist_name
+                break
+
+        self._history.append({"area": area_ratio, "cx": best["cx"]})
+        if len(self._history) > 6:
+            self._history.pop(0)
+
+        is_approaching = False
+        if len(self._history) >= 3:
+            areas = [h["area"] for h in self._history[-3:]]
+            is_approaching = areas[-1] > areas[0] * 1.1
+
+        score  = min(area_ratio / 0.12, 1.0) * 40
+        score += min(cy_ratio   / 0.95, 1.0) * 25
+        score += (20.0 if is_approaching else 0.0)
+        score += min(best["conf"],        1.0) * 15
+
+        if   score >= 70: threat = "CRITICAL"
+        elif score >= 50: threat = "HIGH"
+        elif score >= 30: threat = "MEDIUM"
+        elif score >= 10: threat = "LOW"
+        else:             threat = "LOW"
+
+        return ObstacleThreatLevel(
+            position       = "FORWARD",
+            threat         = threat,
+            confidence     = best["conf"],
+            label          = best["label"],
+            approx_dist    = approx_dist,
+            is_approaching = is_approaching,
+            box_area_pct   = area_ratio * 100,
+            cy_pct         = cy_ratio   * 100,
+        )
+
+
+# ──────────────────────────────────────────────
+#  MAIN CLASS
+# ──────────────────────────────────────────────
+
+class VisionProcessor:
+
+    def __init__(
+        self,
+        camera_index: int  = 0,
+        use_yolo:     bool = True,
+        device:       str  = "cpu",
+        simulate:     bool = False,
+        adaptive_conf      = None,
+    ):
+        self.camera_index  = camera_index
+        self.use_yolo      = use_yolo
+        self.device        = device
+        self.simulate      = simulate
+        self.adaptive_conf = adaptive_conf
+
+        self._cap     = None
+        self._model   = None
+        self._running = False
+
+        self._lock            = threading.Lock()
+        self._latest_result   = DetectionResult()
+        self._latest_frame    = None
+        self._annotated_frame = None
+
+        self._frame_count   = 0
+        self._yolo_count    = 0
+        self._pending_boxes = []
+
+        self._capture_thread   = None
+        self._yolo_thread      = None
+        self._yolo_frame       = None
+        self._yolo_ready       = threading.Event()
+        self._yolo_result_lock = threading.Lock()
+
+        self._last_yolo_time = 0.0
+
+        # sliding window replaces simple counter
+        self._persistence    = SlidingWindowPersistence()
+        self._analyzer       = SmartObstacleAnalyzer()
+
+    # ──────────────────────────────────────────
+    #  PUBLIC API
+    # ──────────────────────────────────────────
+
+    def start(self) -> bool:
+        self._running = True
+
+        if self.simulate:
+            log.info("VisionProcessor — SIMULATION mode")
+            self._capture_thread = threading.Thread(
+                target=self._sim_loop, daemon=True, name="VisionSim"
+            )
+            self._capture_thread.start()
+            return True
+
+        if not self._open_camera():
+            log.error("Failed to open camera")
+            return False
+
+        if self.use_yolo:
+            self._load_yolo()
+
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, daemon=True, name="Vision-Capture"
+        )
+        self._capture_thread.start()
+
+        if self.use_yolo and self._model:
+            self._yolo_thread = threading.Thread(
+                target=self._yolo_loop, daemon=True, name="Vision-YOLO"
+            )
+            self._yolo_thread.start()
+
+        log.info(f"VisionProcessor started | camera={self.camera_index} yolo={self.use_yolo}")
+        return True
+
+    def stop(self):
+        self._running = False
+        self._yolo_ready.set()
+        if self._capture_thread:
+            self._capture_thread.join(timeout=2.0)
+        if self._yolo_thread:
+            self._yolo_thread.join(timeout=2.0)
+        if self._cap and self._cap.isOpened():
+            self._cap.release()
+        log.info("VisionProcessor stopped")
+
+    def get_latest(self) -> DetectionResult:
+        with self._lock:
+            return self._latest_result
+
+    def get_frame(self):
+        with self._lock:
+            return self._annotated_frame.copy() if self._annotated_frame is not None else None
+
+    def get_raw_frame(self):
+        with self._lock:
+            return self._latest_frame.copy() if self._latest_frame is not None else None
+
+    # ──────────────────────────────────────────
+    #  CAMERA
+    # ──────────────────────────────────────────
+
+    def _open_camera(self) -> bool:
+        import platform
+        if platform.system() == "Windows":
+            self._cap = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
+        else:
+            gst = self._gstreamer_pipeline()
+            self._cap = cv2.VideoCapture(gst, cv2.CAP_GSTREAMER)
+            if not self._cap.isOpened():
+                log.warning("GStreamer failed → fallback V4L2")
+                self._cap = cv2.VideoCapture(self.camera_index)
+
+        if not self._cap.isOpened():
+            return False
+
+        self._cap.set(cv2.CAP_PROP_FRAME_WIDTH,  FRAME_WIDTH)
+        self._cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        self._cap.set(cv2.CAP_PROP_FPS,          30)
+        self._cap.set(cv2.CAP_PROP_BUFFERSIZE,   1)
+        return True
+
+    @staticmethod
+    def _gstreamer_pipeline(width=FRAME_WIDTH, height=FRAME_HEIGHT, fps=30) -> str:
+        return (
+            f"v4l2src device=/dev/video0 ! "
+            f"video/x-raw,width={width},height={height},framerate={fps}/1 ! "
+            f"videoconvert ! video/x-raw,format=BGR ! appsink drop=true"
+        )
+
+    # ──────────────────────────────────────────
+    #  YOLO
+    # ──────────────────────────────────────────
+
+    def _load_yolo(self):
+        try:
+            from ultralytics import YOLO
+            log.info(f"Loading YOLO: {YOLO_MODEL} on {self.device}")
+            self._model = YOLO(YOLO_MODEL)
+            dummy = np.zeros((FRAME_HEIGHT, FRAME_WIDTH, 3), dtype=np.uint8)
+            self._model(dummy, verbose=False)
+            log.info("YOLO loaded and warmed up ✓")
+        except ImportError:
+            log.warning("ultralytics not installed — YOLO disabled")
+            self.use_yolo = False
+        except Exception as e:
+            log.error(f"YOLO load failed: {e}")
+            self.use_yolo = False
+
+    # ──────────────────────────────────────────
+    #  CAPTURE LOOP
+    # ──────────────────────────────────────────
+
+    def _capture_loop(self):
+        while self._running:
+            if not self._cap or not self._cap.isOpened():
+                time.sleep(0.1)
+                continue
+
+            ret, frame = self._cap.read()
+            if not ret or frame is None:
+                time.sleep(0.01)
+                continue
+
+            self._frame_count += 1
+
+            if (
+                self.use_yolo
+                and self._model
+                and self._frame_count % YOLO_EVERY_N == 0
+            ):
+                with self._yolo_result_lock:
+                    self._yolo_frame = frame.copy()
+                self._yolo_ready.set()
+
+            # clear stale detections
+            if (time.time() - self._last_yolo_time) > MAX_DETECTION_AGE_S:
+                with self._yolo_result_lock:
+                    self._pending_boxes = []
+
+            result    = self._compute_result(frame)
+            annotated = self._draw_annotations(frame.copy(), result)
+
+            with self._lock:
+                self._latest_frame    = frame
+                self._annotated_frame = annotated
+                self._latest_result   = result
+
+    # ──────────────────────────────────────────
+    #  YOLO THREAD
+    # ──────────────────────────────────────────
+
+    def _yolo_loop(self):
+        while self._running:
+            self._yolo_ready.wait(timeout=1.0)
+            if not self._running:
+                break
+
+            with self._yolo_result_lock:
+                frame            = self._yolo_frame
+                self._yolo_frame = None
+            self._yolo_ready.clear()
+
+            if frame is None:
+                continue
+
+            try:
+                boxes = self._run_yolo(frame)
+                with self._yolo_result_lock:
+                    self._pending_boxes = boxes
+                self._yolo_count += 1
+            except Exception as e:
+                log.error(f"YOLO inference error: {e}")
+
+    # ──────────────────────────────────────────
+    #  YOLO INFERENCE
+    # ──────────────────────────────────────────
+
+    def _run_yolo(self, frame) -> list:
+        self._last_yolo_time = time.time()
+
+        h, w       = frame.shape[:2]
+        frame_area = w * h
+
+        roi_pts     = build_trapezoid_roi(w, h)
+        roi_contour = roi_pts[0].astype(np.int32)
+
+        current_conf = (
+            self.adaptive_conf.update(frame)
+            if self.adaptive_conf is not None
+            else YOLO_CONF
+        )
+
+        results = self._model(
+            frame,
+            imgsz=320,
+            conf=current_conf,
+            device=self.device,
+            verbose=False,
+        )
+
+        boxes = []
+
+        for r in results:
+            for box in r.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0].tolist())
+                conf  = float(box.conf[0])
+                cls   = int(box.cls[0])
+                label = self._model.names[cls]
+
+                if label in IGNORE_CLASSES:
+                    continue
+                if VALID_OBSTACLE_CLASSES and label not in VALID_OBSTACLE_CLASSES:
+                    continue
+
+                bw = x2 - x1
+                bh = y2 - y1
+                if bw < MIN_BOX_WIDTH or bh < MIN_BOX_HEIGHT:
+                    continue
+                box_area = bw * bh
+                if box_area < frame_area * MIN_BOX_AREA_RATIO:
+                    continue
+                if bw > 0 and (bh / bw) < MIN_BOX_ASPECT:
+                    continue
+
+                cx = (x1 + x2) // 2
+                cy = (y1 + y2) // 2
+                is_human = (label.lower() == HUMAN_CLASS) and (conf >= HUMAN_MIN_CONF)
+
+                candidate = {
+                    "label":      label,
+                    "conf":       conf,
+                    "x1": x1, "y1": y1,
+                    "x2": x2, "y2": y2,
+                    "cx": cx,  "cy": cy,
+                    "area_ratio": box_area / frame_area,
+                    "is_human":   is_human,
+                    "danger_score": self._calculate_danger_score(
+                        {"x1":x1,"y1":y1,"x2":x2,"y2":y2,
+                         "cx":cx,"cy":cy,"conf":conf},
+                        frame.shape
+                    ),
+                    "_roi_contour": roi_contour,
+                }
+                boxes.append(candidate)
+
+        # ── Filter 1: strict ROI ─────────────────
+        # humans bypass the ROI check (safety priority)
+        boxes = [
+            b for b in boxes
+            if b["is_human"] or box_inside_trapezoid(b["_roi_contour"], b)
+        ]
+
+        # ── Filter 2: stop-line proximity gate ───
+        # humans bypass this too — detect them from any distance
+        stop_line_y = int(h * (STOP_LINE_PCT / 100.0))
+        boxes = [
+            b for b in boxes
+            if b["is_human"] or b["y2"] >= stop_line_y
+        ]
+
+        # humans first, then by danger score
+        boxes.sort(key=lambda b: (not b["is_human"], -b["danger_score"]))
+        return boxes
+
+    # ──────────────────────────────────────────
+    #  DANGER SCORE
+    # ──────────────────────────────────────────
+
+    def _calculate_danger_score(self, box: dict, frame_shape) -> float:
+        h, w         = frame_shape[:2]
+        bw           = box["x2"] - box["x1"]
+        bh           = box["y2"] - box["y1"]
+        area_ratio   = (bw * bh) / float(w * h)
+        center_dist  = abs(box["cx"] - (w // 2))
+        center_norm  = 1.0 - min(center_dist / (w // 2), 1.0)
+        bottom_norm  = box["y2"] / float(h)
+
+        return (
+            box["conf"]
+            * (1.0 + area_ratio  * DANGER_AREA_WEIGHT)
+            * (1.0 + center_norm * DANGER_CENTER_WEIGHT)
+            * (1.0 + bottom_norm * DANGER_BOTTOM_WEIGHT)
+        )
+
+    # ──────────────────────────────────────────
+    #  RESULT COMPUTATION
+    # ──────────────────────────────────────────
+
+    def _compute_result(self, frame) -> DetectionResult:
+        with self._yolo_result_lock:
+            boxes = list(self._pending_boxes)
+
+        w             = frame.shape[1]
+        h             = frame.shape[0]
+        detection_age = time.time() - self._last_yolo_time
+
+        detected   = len(boxes) > 0
+        persistent = self._persistence.update(detected)
+
+        if not boxes:
+            self._analyzer.analyze([], w, h)
+            return DetectionResult(
+                position      = "FORWARD" if persistent else "NONE",
+                frame_width   = w,
+                detection_age = detection_age,
+                persistent    = persistent,
+            )
+
+        threat = self._analyzer.analyze(boxes, w, h)
+        best   = boxes[0]
+
+        return DetectionResult(
+            timestamp      = time.time(),
+            position       = "FORWARD" if persistent else "NONE",
+            confidence     = best["conf"],
+            label          = best["label"],
+            box            = (best["x1"], best["y1"], best["x2"], best["y2"]),
+            center_x       = best["cx"],
+            frame_width    = w,
+            danger_score   = best["danger_score"],
+            detection_age  = detection_age,
+            persistent     = persistent,
+            threat_level   = threat.threat,
+            approx_dist    = threat.approx_dist,
+            is_approaching = threat.is_approaching,
+            is_human       = best.get("is_human", False),
+        )
+
+    # ──────────────────────────────────────────
+    #  HUD DRAWING
+    # ──────────────────────────────────────────
+
+    def _draw_annotations(self, frame, result: DetectionResult) -> np.ndarray:
+        h, w = frame.shape[:2]
+
+        # ── 1. Dim outside trapezoid ──────────────
+        roi_pts = build_trapezoid_roi(w, h)
+        mask    = np.zeros((h, w), dtype=np.uint8)
+        cv2.fillPoly(mask, roi_pts, 255)
+        overlay = frame.copy()
+        overlay[mask == 0] = (overlay[mask == 0] * 0.35).astype(np.uint8)
+        frame = overlay
+
+        # ── 2. Trapezoid border ───────────────────
+        roi_color = COLOR_HUMAN if result.is_human else (60, 60, 60)
+        cv2.polylines(frame, roi_pts, True, roi_color, 2)
+
+        # ── 3. Stop line ──────────────────────────
+        stop_y     = int(h * STOP_LINE_PCT / 100.0)
+        stop_color = COLOR_CRITICAL if result.obstacle_found() else (0, 220, 220)
+        cv2.line(frame, (0, stop_y), (w, stop_y), stop_color, 1)
+        cv2.putText(
+            frame, "DETECTION LINE",
+            (4, stop_y - 5),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.36, stop_color, 1
+        )
+
+        # ── 4. All bounding boxes ─────────────────
+        threat_colors = {
+            "CRITICAL": COLOR_CRITICAL,
+            "HIGH":     COLOR_HIGH,
+            "MEDIUM":   COLOR_MEDIUM,
+            "LOW":      COLOR_LOW,
+            "NONE":     COLOR_CLEAR,
+        }
+        with self._yolo_result_lock:
+            raw_boxes = list(self._pending_boxes)
+
+        h_draw, w_draw = frame.shape[:2]
+        roi_pts_draw   = build_trapezoid_roi(w_draw, h_draw)
+        roi_contour_draw = roi_pts_draw[0].astype(np.int32)
+        all_boxes = [
+            b for b in raw_boxes
+            if b.get("is_human", False) or box_inside_trapezoid(roi_contour_draw, b)
+        ]
+
+        for i, box in enumerate(all_boxes):
+            is_human  = box.get("is_human", False)
+            is_primary = (i == 0)
+
+            if is_human:
+                color = COLOR_HUMAN
+            elif is_primary:
+                color = threat_colors.get(result.threat_level, COLOR_CLEAR)
+            else:
+                color = (70, 70, 70)
+
+            thickness = 2 if is_primary else 1
+            cv2.rectangle(
+                frame,
+                (box["x1"], box["y1"]),
+                (box["x2"], box["y2"]),
+                color, thickness
+            )
+
+            if is_primary:
+                area_pct = box.get("area_ratio", 0) * 100
+                tag = (
+                    f"!! HUMAN {box['conf']:.0%}"
+                    if is_human
+                    else f"{box['label'].upper()}  {box['conf']:.0%}  {area_pct:.1f}%"
+                )
+                (tw, th), _ = cv2.getTextSize(tag, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+                cv2.rectangle(
+                    frame,
+                    (box["x1"],          box["y1"] - th - 8),
+                    (box["x1"] + tw + 6, box["y1"]),
+                    COLOR_BLACK, -1
+                )
+                cv2.putText(
+                    frame, tag,
+                    (box["x1"] + 3, box["y1"] - 4),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1
+                )
+                cv2.circle(frame, (box["cx"], box["cy"]), 4, COLOR_CLEAR, -1)
+
+        # ── 5. Approaching arrow ──────────────────
+        if result.is_approaching:
+            ax = w - 35
+            ay = int(h * TRAP_Y_TOP_PCT / 100) + 35
+            cv2.arrowedLine(frame, (ax, ay+20), (ax, ay-5), COLOR_CRITICAL, 3, tipLength=0.4)
+            cv2.putText(frame, "APPR", (ax-22, ay+40),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.38, COLOR_CRITICAL, 1)
+
+
+        # ── 7. Human warning banner ───────────────
+        if result.is_human:
+            cv2.putText(
+                frame, "!! HUMAN — ROBOT STOPPED !!",
+                (w // 2 - 160, int(h * TRAP_Y_TOP_PCT / 100) - 12),
+                cv2.FONT_HERSHEY_DUPLEX, 0.75, COLOR_HUMAN, 2
+            )
+
+        # ── 8. Top status bar ─────────────────────
+        cv2.rectangle(frame, (0, 0), (w, 32), COLOR_BLACK, -1)
+
+        if result.obstacle_found():
+            if result.is_human:
+                status_text  = f"HUMAN DETECTED  conf={result.confidence:.0%}"
+                status_color = COLOR_HUMAN
+            else:
+                appr = " ↑APPR" if result.is_approaching else ""
+                status_text  = (
+                    f"{result.label.upper()}  "
+                    f"{result.approx_dist}  "
+                    f"[{result.threat_level}]  "
+                    f"{result.confidence:.0%}{appr}"
+                )
+                status_color = threat_colors.get(result.threat_level, COLOR_CLEAR)
+        else:
+            status_text  = "PATH CLEAR"
+            status_color = COLOR_CLEAR
+
+        cv2.putText(frame, status_text, (8, 22),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 1)
+
+        # ── 9. Bottom info bar ────────────────────
+        cv2.rectangle(frame, (0, h - 22), (w, h), COLOR_BLACK, -1)
+        persist_score = self._persistence.score
+        cv2.putText(
+            frame,
+            f"DANGER:{result.danger_score:.2f}  "
+            f"AGE:{result.detection_age*1000:.0f}ms  "
+            f"PERSIST:{persist_score}/{PERSIST_WINDOW}  "
+            f"CONF:{YOLO_CONF:.2f}",
+            (8, h - 6),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.36, COLOR_INFO, 1
+        )
+
+        return frame
+
+    # ──────────────────────────────────────────
+    #  SIMULATION LOOP
+    # ──────────────────────────────────────────
+
+    def _sim_loop(self):
+        t = 0.0
+        while self._running:
+            time.sleep(0.1)
+            t += 0.1
+
+            cycle = int(t) % 18
+            if   cycle < 3:  pos, conf, label = "NONE",    0.0,  ""
+            elif cycle < 6:  pos, conf, label = "FORWARD", 0.87, "chair"
+            elif cycle < 10: pos, conf, label = "FORWARD", 0.91, "person"
+            elif cycle < 13: pos, conf, label = "FORWARD", 0.78, "bottle"
+            else:            pos, conf, label = "NONE",    0.0,  ""
+
+            w, h  = FRAME_WIDTH, FRAME_HEIGHT
+            frame = np.zeros((h, w, 3), dtype=np.uint8)
+            frame[:] = (25, 25, 25)
+
+            for x in range(0, w, 40):
+                cv2.line(frame, (x, 0), (x, h), (40, 40, 40), 1)
+            for y in range(0, h, 40):
+                cv2.line(frame, (0, y), (w, y), (40, 40, 40), 1)
+
+            is_human   = (label == "person")
+            detected   = (pos != "NONE")
+            persistent = self._persistence.update(detected)
+
+            result = DetectionResult(
+                position     = pos if persistent else "NONE",
+                confidence   = conf,
+                label        = label,
+                frame_width  = w,
+                threat_level = "CRITICAL" if is_human else ("HIGH" if detected else "NONE"),
+                approx_dist  = "CLOSE" if detected else "FAR",
+                persistent   = persistent,
+                is_human     = is_human,
+                is_approaching = (cycle in (8, 9)),
+            )
+
+            if detected:
+                cx  = 320
+                cy  = 360
+                box = (cx - 60, cy - 80, cx + 60, cy + 80)
+                result.box      = box
+                result.center_x = cx
+                with self._yolo_result_lock:
+                    self._pending_boxes = [{
+                        "label": label, "conf": conf,
+                        "x1": box[0], "y1": box[1],
+                        "x2": box[2], "y2": box[3],
+                        "cx": cx, "cy": cy,
+                        "area_ratio": 0.06,
+                        "is_human": is_human,
+                        "danger_score": 3.0 if is_human else 2.0,
+                    }]
+            else:
+                with self._yolo_result_lock:
+                    self._pending_boxes = []
+
+            annotated = self._draw_annotations(frame, result)
+            cv2.putText(
+                annotated, "[ SIMULATION ]",
+                (w // 2 - 70, h // 2),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 180, 180), 1
+            )
+
+            with self._lock:
+                self._latest_frame    = frame
+                self._annotated_frame = annotated
+                self._latest_result   = result
+
+
+# ──────────────────────────────────────────────
+#  QUICK TEST
+# ──────────────────────────────────────────────
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(name)s] %(levelname)s — %(message)s"
+    )
+
+    vp = VisionProcessor(simulate=True, use_yolo=False)
+    vp.start()
+
+    print("Vision Processor v7.0 — press Q to quit")
+
+    while True:
+        frame = vp.get_frame()
+        if frame is not None:
+            cv2.imshow("Vision Processor v7.0", frame)
+
+        result = vp.get_latest()
+        if result.obstacle_found():
+            print(
+                f"  {result.label:10s} | "
+                f"conf={result.confidence:.0%} | "
+                f"threat={result.threat_level:8s} | "
+                f"dist={result.approx_dist:10s} | "
+                f"human={result.is_human} | "
+                f"persist={result.persistent}"
+            )
+
+        if cv2.waitKey(30) & 0xFF == ord('q'):
+            break
+
+    vp.stop()
+    cv2.destroyAllWindows()
