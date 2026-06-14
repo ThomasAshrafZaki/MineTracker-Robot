@@ -2,19 +2,17 @@
 ================================================================================
   vision_processor.py  —  Camera + YOLO Obstacle Detection
 ================================================================================
-  Version 7.0 — Stability Fixes
+  Version 8.0 — GStreamer RTSP Push to MediaMTX
 
-  Changes from v6.0:
-      ✓ STOP_LINE_PCT lowered 70→50 (detects humans/objects from further away)
-      ✓ Sliding window persistence (3 of last 5 frames) — tolerates vibration
-      ✓ Strict ROI enforcement — boxes outside ROI never shown or reported
-      ✓ MIN_PERSISTENCE_FRAMES back to 2 (sliding window handles stability)
-      ✓ SmartObstacleAnalyzer CONFIRM_FRAMES = 2
-      ✓ MAX_DETECTION_AGE_S raised 0.35→0.5 (less flickering on slow YOLO)
-      ✓ Human class always passes ROI check (safety priority)
+  Changes from v7.0:
+      ✓ Removed cv2.imshow display loop
+      ✓ Added GStreamer push pipeline → RTSP → MediaMTX → WebRTC → Browser
+      ✓ Annotated frames (with YOLO boxes) are pushed to rtsp://127.0.0.1:8554/cam
+      ✓ Falls back to x264 software encoding if NVENC not available
+      ✓ mediamtx.yml no longer needs runOnDemand — camera owned by this process
 
   Author  : Robot Team
-  Version : 7.0
+  Version : 8.0
 ================================================================================
 """
 
@@ -39,33 +37,30 @@ FRAME_WIDTH  = 640
 FRAME_HEIGHT = 480
 
 YOLO_EVERY_N = 3
-YOLO_CONF    = 0.45       # lowered slightly for better human detection
+YOLO_CONF    = 0.45
 YOLO_MODEL   = "yolov8n.pt"
 
 # ── Trapezoid ROI ──────────────────────────────
-TRAP_LANE_WIDTH_PCT  = 85  # wider base
+TRAP_LANE_WIDTH_PCT  = 85
 TRAP_TOP_NARROW_PCT  = 25
-TRAP_Y_TOP_PCT       = 30  # start higher to catch humans earlier
+TRAP_Y_TOP_PCT       = 30
 TRAP_Y_BOTTOM_PCT    = 97
 
 # ── Proximity gate ─────────────────────────────
-# lowered from 70→50 so objects/humans detected from further away
 STOP_LINE_PCT = 50
 
 # ── Box filters ────────────────────────────────
-MIN_BOX_AREA_RATIO = 0.008   # lowered — catch smaller/further objects
+MIN_BOX_AREA_RATIO = 0.008
 MIN_BOX_WIDTH      = 20
 MIN_BOX_HEIGHT     = 20
 MIN_BOX_ASPECT     = 0.2
 
 # ── Sliding window persistence ─────────────────
-# "confirmed" if seen in PERSIST_HITS of last PERSIST_WINDOW frames
-# tolerates YOLO missing 1-2 frames due to vibration
 PERSIST_WINDOW = 5
 PERSIST_HITS   = 3
 
 # ── Stale detection ────────────────────────────
-MAX_DETECTION_AGE_S = 0.5   # raised — less flickering on slow YOLO
+MAX_DETECTION_AGE_S = 0.5
 
 # ── Danger score weights ───────────────────────
 DANGER_CENTER_WEIGHT = 1.8
@@ -82,14 +77,12 @@ VALID_OBSTACLE_CLASSES = [
     "refrigerator", "microwave", "oven", "sink",
     "tv", "monitor",
     "potted plant", "umbrella", "box",
-    # حيوانات
     "cat", "dog",
-    # إنسان — بس بـ confidence عالية
     "person",
 ]
 
-HUMAN_CLASS = "person"
-HUMAN_MIN_CONF = 0.75   # human لازم conf عالية عشان ميتعرفش غلط
+HUMAN_CLASS    = "person"
+HUMAN_MIN_CONF = 0.75
 
 # ── HUD colors ─────────────────────────────────
 COLOR_CRITICAL = (0,   0, 255)
@@ -100,6 +93,9 @@ COLOR_CLEAR    = (0, 200,   0)
 COLOR_HUMAN    = (0,   0, 255)
 COLOR_INFO     = (200, 200,   0)
 COLOR_BLACK    = (0,   0,   0)
+
+# ── RTSP push target ───────────────────────────
+MEDIAMTX_RTSP = "rtsp://127.0.0.1:8554/cam"
 
 
 # ──────────────────────────────────────────────
@@ -173,30 +169,23 @@ def point_in_trapezoid(roi_contour: np.ndarray, px: float, py: float) -> bool:
 
 
 def box_inside_trapezoid(roi_contour: np.ndarray, box: dict) -> bool:
-    """
-    Strict ROI check — tests center + all 4 corners + bottom edge midpoint.
-    Box must have at least ONE point inside the trapezoid.
-    This prevents boxes that are mostly outside ROI from slipping through.
-    """
     x1, y1, x2, y2 = box["x1"], box["y1"], box["x2"], box["y2"]
     cx = (x1 + x2) / 2.0
     cy = (y1 + y2) / 2.0
 
     test_pts = [
-        (float(cx),       float(y2)),        # bottom center
-        (float(x1 + 2),   float(y2)),        # bottom left
-        (float(x2 - 2),   float(y2)),        # bottom right
-        (float(cx),       float(cy)),        # center
-        (float(x1 + 2),   float(cy)),        # mid left
-        (float(x2 - 2),   float(cy)),        # mid right
+        (float(cx),       float(y2)),
+        (float(x1 + 2),   float(y2)),
+        (float(x2 - 2),   float(y2)),
+        (float(cx),       float(cy)),
+        (float(x1 + 2),   float(cy)),
+        (float(x2 - 2),   float(cy)),
     ]
     return any(point_in_trapezoid(roi_contour, px, py) for px, py in test_pts)
 
 
 # ──────────────────────────────────────────────
 #  SLIDING WINDOW PERSISTENCE
-#  Stable if seen PERSIST_HITS times in last PERSIST_WINDOW frames.
-#  Tolerates YOLO missing frames due to vibration.
 # ──────────────────────────────────────────────
 
 class SlidingWindowPersistence:
@@ -204,10 +193,9 @@ class SlidingWindowPersistence:
     def __init__(self, window: int = PERSIST_WINDOW, hits: int = PERSIST_HITS):
         self._window  = window
         self._hits    = hits
-        self._history = deque(maxlen=window)  # True/False per frame
+        self._history = deque(maxlen=window)
 
     def update(self, detected: bool) -> bool:
-        """Add frame result, return True if persistently confirmed."""
         self._history.append(detected)
         return sum(self._history) >= self._hits
 
@@ -326,9 +314,11 @@ class VisionProcessor:
 
         self._last_yolo_time = 0.0
 
-        # sliding window replaces simple counter
         self._persistence    = SlidingWindowPersistence()
         self._analyzer       = SmartObstacleAnalyzer()
+
+        # GStreamer push pipeline to MediaMTX
+        self._gst_pipeline   = None
 
     # ──────────────────────────────────────────
     #  PUBLIC API
@@ -343,6 +333,7 @@ class VisionProcessor:
                 target=self._sim_loop, daemon=True, name="VisionSim"
             )
             self._capture_thread.start()
+            self._start_gst_push()
             return True
 
         if not self._open_camera():
@@ -364,11 +355,21 @@ class VisionProcessor:
             self._yolo_thread.start()
 
         log.info(f"VisionProcessor started | camera={self.camera_index} yolo={self.use_yolo}")
+
+        # Start GStreamer push to MediaMTX
+        self._start_gst_push()
+
         return True
 
     def stop(self):
         self._running = False
         self._yolo_ready.set()
+
+        if self._gst_pipeline:
+            self._gst_pipeline.release()
+            self._gst_pipeline = None
+            log.info("GStreamer push pipeline stopped")
+
         if self._capture_thread:
             self._capture_thread.join(timeout=2.0)
         if self._yolo_thread:
@@ -388,6 +389,73 @@ class VisionProcessor:
     def get_raw_frame(self):
         with self._lock:
             return self._latest_frame.copy() if self._latest_frame is not None else None
+
+    # ──────────────────────────────────────────
+    #  GSTREAMER PUSH TO MEDIAMTX
+    # ──────────────────────────────────────────
+
+    def _start_gst_push(self):
+        """
+        Push annotated frames to MediaMTX via RTSP.
+        mediamtx.yml should have an empty 'cam' path (no runOnDemand).
+        The browser connects to: http://<JETSON_IP>:8889/cam
+        """
+        # Try NVENC hardware encoding first
+        nvenc_pipeline = (
+            'appsrc ! videoconvert '
+            '! video/x-raw,format=I420 '
+            '! nvv4l2h264enc bitrate=2000000 iframeinterval=30 '
+            '! h264parse '
+            f'! rtspclientsink location={MEDIAMTX_RTSP} protocols=tcp'
+        )
+
+        # Software fallback
+        x264_pipeline = (
+            'appsrc ! videoconvert '
+            '! video/x-raw,format=I420 '
+            '! x264enc tune=zerolatency speed-preset=ultrafast bitrate=2000 '
+            '! h264parse '
+            f'! rtspclientsink location={MEDIAMTX_RTSP} protocols=tcp'
+        )
+
+        # Try NVENC first
+        writer = cv2.VideoWriter(
+            nvenc_pipeline,
+            cv2.CAP_GSTREAMER, 0, 30,
+            (FRAME_WIDTH, FRAME_HEIGHT), True
+        )
+
+        if writer.isOpened():
+            self._gst_pipeline = writer
+            log.info(f"GStreamer NVENC push → {MEDIAMTX_RTSP}")
+            return
+
+        writer.release()
+
+        # Fallback to x264
+        writer = cv2.VideoWriter(
+            x264_pipeline,
+            cv2.CAP_GSTREAMER, 0, 30,
+            (FRAME_WIDTH, FRAME_HEIGHT), True
+        )
+
+        if writer.isOpened():
+            self._gst_pipeline = writer
+            log.info(f"GStreamer x264 push → {MEDIAMTX_RTSP}")
+            return
+
+        writer.release()
+        log.error(
+            "GStreamer push pipeline failed to open. "
+            "Make sure MediaMTX is running and GStreamer is installed. "
+            "Video will NOT be streamed."
+        )
+        self._gst_pipeline = None
+
+    def _push_frame(self, frame: np.ndarray):
+        """Write one annotated frame to the GStreamer pipeline."""
+        if self._gst_pipeline and self._gst_pipeline.isOpened():
+            self._gst_pipeline.write(frame)
 
     # ──────────────────────────────────────────
     #  CAMERA
@@ -478,6 +546,9 @@ class VisionProcessor:
                 self._latest_frame    = frame
                 self._annotated_frame = annotated
                 self._latest_result   = result
+
+            # Push annotated frame to MediaMTX
+            self._push_frame(annotated)
 
     # ──────────────────────────────────────────
     #  YOLO THREAD
@@ -577,22 +648,19 @@ class VisionProcessor:
                 }
                 boxes.append(candidate)
 
-        # ── Filter 1: strict ROI ─────────────────
-        # humans bypass the ROI check (safety priority)
+        # Filter: strict ROI (humans bypass)
         boxes = [
             b for b in boxes
             if b["is_human"] or box_inside_trapezoid(b["_roi_contour"], b)
         ]
 
-        # ── Filter 2: stop-line proximity gate ───
-        # humans bypass this too — detect them from any distance
+        # Filter: stop-line proximity gate (humans bypass)
         stop_line_y = int(h * (STOP_LINE_PCT / 100.0))
         boxes = [
             b for b in boxes
             if b["is_human"] or b["y2"] >= stop_line_y
         ]
 
-        # humans first, then by danger score
         boxes.sort(key=lambda b: (not b["is_human"], -b["danger_score"]))
         return boxes
 
@@ -667,7 +735,7 @@ class VisionProcessor:
     def _draw_annotations(self, frame, result: DetectionResult) -> np.ndarray:
         h, w = frame.shape[:2]
 
-        # ── 1. Dim outside trapezoid ──────────────
+        # 1. Dim outside trapezoid
         roi_pts = build_trapezoid_roi(w, h)
         mask    = np.zeros((h, w), dtype=np.uint8)
         cv2.fillPoly(mask, roi_pts, 255)
@@ -675,11 +743,11 @@ class VisionProcessor:
         overlay[mask == 0] = (overlay[mask == 0] * 0.35).astype(np.uint8)
         frame = overlay
 
-        # ── 2. Trapezoid border ───────────────────
+        # 2. Trapezoid border
         roi_color = COLOR_HUMAN if result.is_human else (60, 60, 60)
         cv2.polylines(frame, roi_pts, True, roi_color, 2)
 
-        # ── 3. Stop line ──────────────────────────
+        # 3. Stop line
         stop_y     = int(h * STOP_LINE_PCT / 100.0)
         stop_color = COLOR_CRITICAL if result.obstacle_found() else (0, 220, 220)
         cv2.line(frame, (0, stop_y), (w, stop_y), stop_color, 1)
@@ -689,7 +757,7 @@ class VisionProcessor:
             cv2.FONT_HERSHEY_SIMPLEX, 0.36, stop_color, 1
         )
 
-        # ── 4. All bounding boxes ─────────────────
+        # 4. All bounding boxes
         threat_colors = {
             "CRITICAL": COLOR_CRITICAL,
             "HIGH":     COLOR_HIGH,
@@ -700,8 +768,8 @@ class VisionProcessor:
         with self._yolo_result_lock:
             raw_boxes = list(self._pending_boxes)
 
-        h_draw, w_draw = frame.shape[:2]
-        roi_pts_draw   = build_trapezoid_roi(w_draw, h_draw)
+        h_draw, w_draw   = frame.shape[:2]
+        roi_pts_draw     = build_trapezoid_roi(w_draw, h_draw)
         roi_contour_draw = roi_pts_draw[0].astype(np.int32)
         all_boxes = [
             b for b in raw_boxes
@@ -709,7 +777,7 @@ class VisionProcessor:
         ]
 
         for i, box in enumerate(all_boxes):
-            is_human  = box.get("is_human", False)
+            is_human   = box.get("is_human", False)
             is_primary = (i == 0)
 
             if is_human:
@@ -748,7 +816,7 @@ class VisionProcessor:
                 )
                 cv2.circle(frame, (box["cx"], box["cy"]), 4, COLOR_CLEAR, -1)
 
-        # ── 5. Approaching arrow ──────────────────
+        # 5. Approaching arrow
         if result.is_approaching:
             ax = w - 35
             ay = int(h * TRAP_Y_TOP_PCT / 100) + 35
@@ -756,8 +824,7 @@ class VisionProcessor:
             cv2.putText(frame, "APPR", (ax-22, ay+40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.38, COLOR_CRITICAL, 1)
 
-
-        # ── 7. Human warning banner ───────────────
+        # 6. Human warning banner
         if result.is_human:
             cv2.putText(
                 frame, "!! HUMAN — ROBOT STOPPED !!",
@@ -765,7 +832,7 @@ class VisionProcessor:
                 cv2.FONT_HERSHEY_DUPLEX, 0.75, COLOR_HUMAN, 2
             )
 
-        # ── 8. Top status bar ─────────────────────
+        # 7. Top status bar
         cv2.rectangle(frame, (0, 0), (w, 32), COLOR_BLACK, -1)
 
         if result.obstacle_found():
@@ -788,7 +855,7 @@ class VisionProcessor:
         cv2.putText(frame, status_text, (8, 22),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.55, status_color, 1)
 
-        # ── 9. Bottom info bar ────────────────────
+        # 8. Bottom info bar
         cv2.rectangle(frame, (0, h - 22), (w, h), COLOR_BLACK, -1)
         persist_score = self._persistence.score
         cv2.putText(
@@ -877,6 +944,9 @@ class VisionProcessor:
                 self._annotated_frame = annotated
                 self._latest_result   = result
 
+            # Push annotated frame to MediaMTX
+            self._push_frame(annotated)
+
 
 # ──────────────────────────────────────────────
 #  QUICK TEST
@@ -891,26 +961,22 @@ if __name__ == "__main__":
     vp = VisionProcessor(simulate=True, use_yolo=False)
     vp.start()
 
-    print("Vision Processor v7.0 — press Q to quit")
+    print("Vision Processor v8.0 — streaming to rtsp://127.0.0.1:8554/cam")
+    print("Open browser: http://192.168.1.4:8889/cam")
+    print("Press Ctrl+C to stop")
 
-    while True:
-        frame = vp.get_frame()
-        if frame is not None:
-            cv2.imshow("Vision Processor v7.0", frame)
-
-        result = vp.get_latest()
-        if result.obstacle_found():
-            print(
-                f"  {result.label:10s} | "
-                f"conf={result.confidence:.0%} | "
-                f"threat={result.threat_level:8s} | "
-                f"dist={result.approx_dist:10s} | "
-                f"human={result.is_human} | "
-                f"persist={result.persistent}"
-            )
-
-        if cv2.waitKey(30) & 0xFF == ord('q'):
-            break
+    try:
+        while True:
+            time.sleep(1)
+            result = vp.get_latest()
+            if result.obstacle_found():
+                print(
+                    f"  {result.label:10s} | "
+                    f"conf={result.confidence:.0%} | "
+                    f"threat={result.threat_level:8s} | "
+                    f"human={result.is_human}"
+                )
+    except KeyboardInterrupt:
+        pass
 
     vp.stop()
-    cv2.destroyAllWindows()
