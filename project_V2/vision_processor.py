@@ -903,6 +903,14 @@ class VisionProcessor:
 
         self._last_yolo_time = 0.0
 
+        # ── ROI cache (trapezoid points / contour / dim-mask) ──
+        # بيتحسب مرة واحدة بس لكل (w, h) ويتخزن، بدل ما يتعاد حسابه
+        # كل فريم في _run_yolo و _draw_annotations
+        self._roi_cache_dims     = None
+        self._roi_pts            = None
+        self._roi_contour        = None
+        self._roi_outside_mask   = None
+
         self._persistence = SlidingWindowPersistence()
         self._analyzer    = SmartObstacleAnalyzer()
 
@@ -913,6 +921,10 @@ class VisionProcessor:
         from sign_detector import SignDetector
         self._sign_detector           = SignDetector()
         self._sign_detector_available = False
+        self._sign_thread             = None
+        self._sign_frame              = None
+        self._sign_ready              = threading.Event()
+        self._sign_frame_lock         = threading.Lock()
 
         # GStreamer push pipeline to MediaMTX
         self._gst_pipeline = None
@@ -968,6 +980,12 @@ class VisionProcessor:
             )
             self._yolo_thread.start()
 
+        if self._sign_detector_available:
+            self._sign_thread = threading.Thread(
+                target=self._sign_loop, daemon=True, name="Vision-Sign"
+            )
+            self._sign_thread.start()
+
         log.info(
             f"VisionProcessor started | camera={self.camera_index} "
             f"yolo={self.use_yolo} env={self.use_env} sign={self._sign_detector_available}"
@@ -979,6 +997,7 @@ class VisionProcessor:
     def stop(self):
         self._running = False
         self._yolo_ready.set()
+        self._sign_ready.set()   # ← wake sign thread عشان يخرج من الـ wait
 
         if self.use_env:
             self._env_classifier.stop()
@@ -996,6 +1015,8 @@ class VisionProcessor:
             self._capture_thread.join(timeout=2.0)
         if self._yolo_thread:
             self._yolo_thread.join(timeout=2.0)
+        if self._sign_thread:
+            self._sign_thread.join(timeout=2.0)
         if self._cap and self._cap.isOpened():
             self._cap.release()
         log.info("VisionProcessor stopped")
@@ -1102,6 +1123,33 @@ class VisionProcessor:
         )
 
     # ──────────────────────────────────────────
+    #  ROI CACHE
+    # ──────────────────────────────────────────
+
+    def _get_roi(self, w: int, h: int):
+        """
+        بيرجع (roi_pts, roi_contour, outside_mask) لمقاس فريم (w, h).
+        بيتحسب مرة واحدة بس ويتخزن — لو نفس المقاس جه تاني (الحالة العادية
+        لأن الكاميرا ثابتة على FRAME_WIDTH × FRAME_HEIGHT)، بيرجع نفس
+        القيم المحفوظة من غير ما يعيد build_trapezoid_roi / fillPoly تاني.
+        لو المقاس اتغير (نادر)، بيعيد الحساب تلقائي.
+        """
+        if self._roi_cache_dims != (w, h):
+            roi_pts     = build_trapezoid_roi(w, h)
+            roi_contour = roi_pts[0].astype(np.int32)
+
+            mask = np.zeros((h, w), dtype=np.uint8)
+            cv2.fillPoly(mask, roi_pts, 255)
+            outside_mask = (mask == 0)
+
+            self._roi_cache_dims   = (w, h)
+            self._roi_pts          = roi_pts
+            self._roi_contour      = roi_contour
+            self._roi_outside_mask = outside_mask
+
+        return self._roi_pts, self._roi_contour, self._roi_outside_mask
+
+    # ──────────────────────────────────────────
     #  YOLO
     # ──────────────────────────────────────────
 
@@ -1137,18 +1185,11 @@ class VisionProcessor:
 
             self._frame_count += 1
 
-            # ── Sign detection — every frame ─────
+            # ── Sign detection — async (thread منفصل) ───
             if self._sign_detector_available:
-                try:
-                    sign_result = self._sign_detector.process_frame(frame)
-                    if sign_result.danger_confirmed:
-                        log.warning(
-                            f"[SignDetector] DANGER confirmed — "
-                            f"reason={sign_result.reason} "
-                            f"word='{sign_result.text_matched_word}'"
-                        )
-                except Exception as e:
-                    log.error(f"SignDetector process_frame error: {e}")
+                with self._sign_frame_lock:
+                    self._sign_frame = frame   # latest frame فقط — القديم بيتبدل
+                self._sign_ready.set()
 
             # ── YOLO every N frames ──────────────
             if (
@@ -1206,8 +1247,38 @@ class VisionProcessor:
                 log.error(f"YOLO inference error: {e}")
 
     # ──────────────────────────────────────────
-    #  YOLO INFERENCE
+    #  SIGN DETECTOR THREAD
     # ──────────────────────────────────────────
+
+    def _sign_loop(self):
+        """
+        Thread منفصل للـ sign detector — مش بيـblock الـ capture loop خالص.
+        بياخد آخر frame متاح ويشتغل عليه. لو الـ processing بطيئة،
+        الفريمات اللي بينهم بتتجاهل (latest-frame-wins).
+        """
+        while self._running:
+            self._sign_ready.wait(timeout=1.0)
+            if not self._running:
+                break
+
+            with self._sign_frame_lock:
+                frame           = self._sign_frame
+                self._sign_frame = None
+            self._sign_ready.clear()
+
+            if frame is None:
+                continue
+
+            try:
+                sign_result = self._sign_detector.process_frame(frame)
+                if sign_result.danger_confirmed:
+                    log.warning(
+                        f"[SignDetector] DANGER confirmed — "
+                        f"reason={sign_result.reason} "
+                        f"word='{sign_result.text_matched_word}'"
+                    )
+            except Exception as e:
+                log.error(f"SignDetector process_frame error: {e}")
 
     def _run_yolo(self, frame) -> list:
         self._last_yolo_time = time.time()
@@ -1215,8 +1286,7 @@ class VisionProcessor:
         h, w       = frame.shape[:2]
         frame_area = w * h
 
-        roi_pts     = build_trapezoid_roi(w, h)
-        roi_contour = roi_pts[0].astype(np.int32)
+        roi_pts, roi_contour, _ = self._get_roi(w, h)
 
         current_conf = (
             self.adaptive_conf.update(frame)
@@ -1360,11 +1430,9 @@ class VisionProcessor:
         h, w = frame.shape[:2]
 
         # 1. Dim outside trapezoid
-        roi_pts = build_trapezoid_roi(w, h)
-        mask    = np.zeros((h, w), dtype=np.uint8)
-        cv2.fillPoly(mask, roi_pts, 255)
+        roi_pts, roi_contour, outside_mask = self._get_roi(w, h)
         overlay = frame.copy()
-        overlay[mask == 0] = (overlay[mask == 0] * 0.35).astype(np.uint8)
+        overlay[outside_mask] = (overlay[outside_mask] * 0.35).astype(np.uint8)
         frame = overlay
 
         # 2. Trapezoid border
@@ -1389,13 +1457,10 @@ class VisionProcessor:
         with self._yolo_result_lock:
             raw_boxes = list(self._pending_boxes)
 
-        h_draw, w_draw   = frame.shape[:2]
-        roi_pts_draw     = build_trapezoid_roi(w_draw, h_draw)
-        roi_contour_draw = roi_pts_draw[0].astype(np.int32)
-        all_boxes = [
-            b for b in raw_boxes
-            if b.get("is_human", False) or box_inside_trapezoid(roi_contour_draw, b)
-        ]
+        # ملحوظة: raw_boxes متفلترة بالفعل بالنسبة لعضوية الـ trapezoid
+        # (الفلتر اتعمل مرة واحدة في _run_yolo) — مفيش داعي نعيد
+        # build_trapezoid_roi ولا box_inside_trapezoid تاني هنا.
+        all_boxes = raw_boxes
 
         for i, box in enumerate(all_boxes):
             is_human   = box.get("is_human", False)

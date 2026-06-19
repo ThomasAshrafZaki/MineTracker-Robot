@@ -48,12 +48,18 @@ from mission_logger    import MissionLogger
 # ──────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
 
+# Unicode fix للـ Windows console (cp1252 مش بتعرف → ✓ إلخ)
+import io as _io
+if sys.platform == "win32":
+    sys.stdout = _io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
+    sys.stderr = _io.TextIOWrapper(sys.stderr.buffer, encoding="utf-8", errors="replace")
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)-18s] %(levelname)s — %(message)s",
     handlers=[
         logging.StreamHandler(sys.stdout),
-        logging.FileHandler("logs/robot.log", mode="a"),
+        logging.FileHandler("logs/robot.log", mode="a", encoding="utf-8"),
     ],
 )
 log = logging.getLogger("Main")
@@ -81,10 +87,10 @@ def draw_hud(
     logger_stats: dict,
     safety_state: str,
     paused:       bool,
-    env_label:    str  = "",      # ← جديد
-    env_conf:     float = 0.0,    # ← جديد
-    sign_danger:  bool  = False,  # ← جديد: sign detector result
-    sign_reason:  str   = "",     # ← جديد
+    env_label:    str   = "",
+    env_conf:     float = 0.0,
+    sign_danger:  bool  = False,
+    sign_reason:  str   = "",
 ) -> np.ndarray:
 
     h, w = frame.shape[:2]
@@ -132,7 +138,7 @@ def draw_hud(
         cv2.FONT_HERSHEY_SIMPLEX, 0.42, _C_GRAY, 1
     )
 
-    # ── Environment label — أسفل يسار فوق الـ bottom bar ──
+    # ── Environment label ──────────────────────────────────
     if env_label and env_label != "Unknown":
         env_text  = f"ENV: {env_label}  ({env_conf:.0%})"
         env_color = _C_ENV
@@ -146,15 +152,13 @@ def draw_hud(
         cv2.FONT_HERSHEY_SIMPLEX, 0.50, env_color, 1
     )
 
-    # ── Sign danger banner — وسط الشاشة لو فيه لوحة خطر متأكدة ──
+    # ── Sign danger banner ─────────────────────────────────
     if sign_danger:
-        banner_y1 = h // 2 - 28
-        banner_y2 = h // 2 + 28
-        cv2.rectangle(frame, (0, banner_y1), (w, banner_y2), (0, 0, 160), -1)
+        cv2.rectangle(frame, (0, h // 2 - 28), (w, h // 2 + 28), (0, 0, 140), -1)
         cv2.putText(
             frame,
-            f"!! DANGER SIGN [{sign_reason}] !!",
-            (w // 2 - 165, h // 2 + 9),
+            f"!! DANGER SIGN  [{sign_reason}] !!",
+            (w // 2 - 170, h // 2 + 9),
             cv2.FONT_HERSHEY_DUPLEX, 0.80, _C_RED, 2,
         )
 
@@ -207,9 +211,7 @@ def main():
         simulate=args.simulate,
     )
 
-    # نحتفظ بفلاق الـ sign هنا في main لأن VisionProcessor بيشغله تلقائياً
-    # لو --no-sign اتعمل، هنتجاهل نتيجة الـ sign في الـ main loop
-    _use_sign = not args.no_sign
+    _use_sign = not args.no_sign   # فلاق التحكم في كشف اللوحات
 
     # callbacks للـ human safety
     def on_human_detected(event: HumanEvent):
@@ -271,11 +273,14 @@ def main():
                 bridge.send_stop()
 
             # ── sign detector gate ────────────
-            sign = vision.get_latest_sign() if _use_sign else None
-            if sign is not None and sign.danger_confirmed:
-                bridge.send_stop()
-                if hasattr(logger, "log_sign_danger"):
-                    logger.log_sign_danger(sign.reason)
+            if _use_sign:
+                sign = vision.get_latest_sign()
+                if sign is not None and sign.danger_confirmed:
+                    bridge.send_stop()
+                    if hasattr(logger, "log_sign_danger"):
+                        logger.log_sign_danger(sign.reason)
+            else:
+                sign = None
 
 
             # ── headless mode ────────────────
@@ -294,7 +299,6 @@ def main():
             lstats = logger.stats()
             sstate = safety.get_state()
             env    = vision.get_environment()          # ← جديد
-            sign   = vision.get_latest_sign() if _use_sign else None
 
             annotated = draw_hud(
                 frame, us, vis,
@@ -302,8 +306,6 @@ def main():
                 paused=paused[0],
                 env_label=env.label,                   # ← جديد
                 env_conf=env.confidence,               # ← جديد
-                sign_danger=sign.danger_confirmed if sign else False,
-                sign_reason=sign.reason        if sign else "",
             )
 
             cv2.imshow("Landmine Robot — Vision", annotated)

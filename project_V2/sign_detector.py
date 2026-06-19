@@ -158,12 +158,19 @@ TEXTURE_MAX_EDGE_DENSITY  = 0.65   # مرفوع
 #  STAGE 5 — TEMPORAL GATE CONSTANTS
 # ══════════════════════════════════════════════════════════
 
-# نافذة زمنية معقولة: 7 من 12 فريم (بدلاً من 12 من 16)
 TEMPORAL_WINDOW  = 12
 TEMPORAL_HITS    = 7
 
-# Cooldown مخفّض: ثانية ونص
-TEMPORAL_COOLDOWN_SEC = 1.5
+# بعد التأكيد: reset الـ history عشان الـ detection الجاي يبني من الصفر
+TEMPORAL_COOLDOWN_SEC = 3.0
+
+# لما اللوحة تختفي: عدد الفريمات المتتالية الفاشلة في Stage 1 قبل ما نمسح الـ danger
+# 20 فريم = ~670ms على 30fps — بيتجاهل الـ flicker العادي
+CLEAR_STREAK_NEEDED = 20
+
+# الحد الأدنى للوقت اللي الـ danger_confirmed بيفضل active فيه بعد التأكيد
+# حتى لو Stage 1 فشلت فجأة (إضاءة، زاوية)، الـ danger مش بيروح قبل الوقت ده
+DANGER_MIN_HOLD_SEC = 2.0
 
 
 # ══════════════════════════════════════════════════════════
@@ -262,6 +269,7 @@ class _TemporalGate:
         confirmed = sum(self._hist) >= self._hits
         if confirmed:
             self._cooldown_until = time.time() + TEMPORAL_COOLDOWN_SEC
+            self._hist.clear()  # ← الـ detection الجاي يبني من الصفر
         return confirmed
 
     def reset(self):
@@ -851,9 +859,14 @@ class SignDetector:
         self._temporal     = _TemporalGate(TEMPORAL_WINDOW, TEMPORAL_HITS)
         self._text         = _TextDetector()
 
-        self._frame_count  = 0
-        self._lock         = threading.Lock()
-        self._latest       = SignDetectionResult()
+        self._frame_count      = 0
+        self._lock             = threading.Lock()
+        self._latest           = SignDetectionResult()
+
+        # لما الـ danger يتأكد، بنسجل الوقت عشان نضمن minimum hold
+        self._danger_held_until = 0.0   # danger_confirmed = True لحد الوقت ده على الأقل
+        self._clear_streak      = 0     # عداد الفريمات المتتالية الفاشلة في Stage 1
+        self._danger_active     = False # True لما يكون danger_confirmed حصل
 
         # للـ debug: عداد رفض كل stage
         self._rejection_stats = {
@@ -893,17 +906,47 @@ class SignDetector:
         color_result, color_mask = self._color_gate.run(frame)
         if not color_result.passed:
             self._rejection_stats["stage1_color"] += 1
-            # Stage 1 فشل → temporal gate بـ False
             self._temporal.update(False)
-            result = SignDetectionResult(
-                stage1_color=False,
-                danger_confirmed=False,
-                reject_reason=f"[S1-Color] {color_result.reason}",
-            )
-            with self._lock:
-                self._latest = result
-            return result
+            self._clear_streak += 1
 
+            # لو الـ danger كان active، نشوف هل المفروض يفضل active
+            still_held   = time.time() < self._danger_held_until
+            streak_ok    = self._clear_streak < CLEAR_STREAK_NEEDED
+
+            if self._danger_active and (still_held or streak_ok):
+                # الـ danger لسه active — إما في الـ hold window أو الـ streak مش كفاية
+                with self._lock:
+                    # نحدث الـ latest بس نخلي danger_confirmed = True
+                    held_result = SignDetectionResult(
+                        stage1_color=False,
+                        danger_confirmed=True,
+                        reason="HELD",
+                        reject_reason=(
+                            f"[S1-Color] {color_result.reason} "
+                            f"| held (streak={self._clear_streak}/{CLEAR_STREAK_NEEDED})"
+                        ),
+                    )
+                    self._latest = held_result
+                return held_result
+            else:
+                # الـ danger اتمسح فعلاً
+                if self._danger_active:
+                    self._danger_active = False
+                    log.info(
+                        f"[SignDetector] CLEAR confirmed after {self._clear_streak} "
+                        f"consecutive no-color frames — danger reset"
+                    )
+                result = SignDetectionResult(
+                    stage1_color=False,
+                    danger_confirmed=False,
+                    reject_reason=f"[S1-Color] {color_result.reason}",
+                )
+                with self._lock:
+                    self._latest = result
+                return result
+
+        # اللوحة لسه موجودة → reset الـ clear streak
+        self._clear_streak = 0
         total_score += color_result.score
 
         # ─── Stage 2: SHAPE GATE ─────────────────────────────
@@ -1050,6 +1093,9 @@ class SignDetector:
 
         # ─── DANGER CONFIRMED ─────────────────────────────────
         self._rejection_stats["confirmed"] += 1
+        self._danger_active     = True
+        self._clear_streak      = 0
+        self._danger_held_until = time.time() + DANGER_MIN_HOLD_SEC
 
         if text_detected and total_score > threshold + 20:
             reason = f"SHAPE+TEXT ({severity})"

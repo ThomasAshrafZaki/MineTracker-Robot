@@ -16,14 +16,12 @@
 ================================================================================
 """
 
-import cv2
 import os
 import threading
 import time
 import logging
 
 from dataclasses import dataclass, field
-from datetime import datetime
 from typing import Optional, Callable
 
 from vision_processor import VisionProcessor, DetectionResult
@@ -44,8 +42,6 @@ HUMAN_CLEAR_DELAY_S = 3.0
 # minimum confidence عشان نعتبره إنسان حقيقي
 HUMAN_CONF_MIN = 0.75
 
-# مجلد حفظ صور الإنسان
-HUMAN_SAVE_DIR = "logs/human_detections"
 
 # كام مرة في الثانية نفحص
 MONITOR_HZ = 10
@@ -66,7 +62,6 @@ class HumanEvent:
     """تسجيل كل حدث كشف إنسان."""
     timestamp:   float = field(default_factory=time.time)
     confidence:  float = 0.0
-    saved_path:  str   = ""
     duration_s:  float = 0.0   # كام ثانية وقف الروبوت
 
 
@@ -113,7 +108,7 @@ class HumanSafetyMonitor:
         self._total_detections = 0
         self._total_stops      = 0
 
-        os.makedirs(HUMAN_SAVE_DIR, exist_ok=True)
+
 
     # ──────────────────────────────────────────
     #  PUBLIC API
@@ -246,19 +241,7 @@ class HumanSafetyMonitor:
         # وقف الروبوت فوراً
         self._send_stop()
 
-        # احفظ صورة في thread منفصل عشان ما يبطئش الـ monitor
-        frame = self.vision.get_raw_frame()
-        if frame is not None:
-            event = HumanEvent(confidence=result.confidence)
-            self._current_event = event
-            threading.Thread(
-                target=self._save_image,
-                args=(frame, event),
-                daemon=True,
-                name="HumanSave"
-            ).start()
-        else:
-            self._current_event = HumanEvent(confidence=result.confidence)
+        self._current_event = HumanEvent(confidence=result.confidence)
 
         if self._on_detected and self._current_event:
             try:
@@ -296,17 +279,7 @@ class HumanSafetyMonitor:
         except Exception as e:
             log.error(f"Failed to send STOP: {e}")
 
-    def _save_image(self, frame, event: HumanEvent):
-        """يحفظ صورة مع timestamp في مجلد منفصل."""
-        try:
-            ts   = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:19]
-            name = f"HUMAN_{ts}_conf{event.confidence:.0%}.jpg"
-            path = os.path.join(HUMAN_SAVE_DIR, name)
-            cv2.imwrite(path, frame)
-            event.saved_path = path
-            log.info(f"Human image saved: {path}")
-        except Exception as e:
-            log.warning(f"Failed to save human image: {e}")
+
 
 
 # ──────────────────────────────────────────────

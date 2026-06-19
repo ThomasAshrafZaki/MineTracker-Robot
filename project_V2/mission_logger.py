@@ -2,41 +2,48 @@
 ================================================================================
   mission_logger.py  —  Mission Data Logger
 ================================================================================
-  Version 2.0 — Environment Logging Added
+  Version 3.0
 
-  لوجين منفصلين تماماً:
+  فولدرين بس:
 
-  1) MINE LOG — كل ما الأردوينو يكتشف لغم
-       logs/mines/MINE_YYYYMMDD_HHMMSS.jpg
-       logs/mines/mines_log.csv
+  1) CAMERA DETECTIONS  — logs/camera_detections/
+       صورة لكل detection جديد من الكاميرا
+       - لو نفس الـ object لسه موجود → صورة واحدة بس (مش spam)
+       - لو اختفى وجه تاني → صورة جديدة
+       - auto-delete لما يتخطى MAX_CAMERA_IMAGES صورة
 
-  2) OBSTACLE LOG — كل ما YOLO يكتشف عائق جديد
-       logs/obstacles/OBS_YYYYMMDD_HHMMSS_label.jpg
-       logs/obstacles/obstacles_log.csv
+  2) OBSTACLE EVENTS  — logs/obstacle_events/
+       بيتفعل فقط لما الـ Ultrasonic الأمامي يشوف عائق
+       - صورة للعائق
+       - Excel sheet: رقم + اسم + وقت + GPS + بيئة + صورة
+       - ده اللي هيترفع على Cloud
 
-  3) ENVIRONMENT LOG  ← جديد
-       logs/environment/environment_log.csv
-       — بيسجل كل تغيير في تصنيف البيئة
-       — cooldown 15 ثانية عشان ما يكررش نفس البيئة كتير
+  ملاحظة: لما Arduino مش موصل → رسالة واحدة في اللوج وكمّل طبيعي
 
   Author  : Robot Team
-  Version : 2.0
+  Version : 3.0
 ================================================================================
 """
 
 import cv2
-import csv
 import os
 import threading
 import time
 import logging
-import shutil
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
-from vision_processor import VisionProcessor, DetectionResult, EnvironmentResult
+try:
+    from openpyxl import Workbook, load_workbook
+    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+    from openpyxl.utils import get_column_letter
+    EXCEL_AVAILABLE = True
+except ImportError:
+    EXCEL_AVAILABLE = False
+
+from vision_processor import VisionProcessor, DetectionResult
 from arduino_bridge import ArduinoBridge, Telemetry
 
 log = logging.getLogger("MissionLogger")
@@ -45,31 +52,38 @@ log = logging.getLogger("MissionLogger")
 #  CONSTANTS
 # ──────────────────────────────────────────────
 
-MINE_DIR        = "logs/mines"
-OBSTACLE_DIR    = "logs/obstacles"
-ENVIRONMENT_DIR = "logs/environment"      # ← جديد
+CAMERA_DIR        = "logs/camera_detections"
+OBSTACLE_DIR      = "logs/obstacle_events"
+OBSTACLE_EXCEL    = os.path.join(OBSTACLE_DIR, "obstacles_log.xlsx")
 
-MINE_CSV        = os.path.join(MINE_DIR,        "mines_log.csv")
-OBSTACLE_CSV    = os.path.join(OBSTACLE_DIR,    "obstacles_log.csv")
-ENVIRONMENT_CSV = os.path.join(ENVIRONMENT_DIR, "environment_log.csv")  # ← جديد
+# عدد صور الكاميرا الأقصى قبل الـ auto-delete
+MAX_CAMERA_IMAGES = 100
 
-# cooldown — بعد ما يحفظ صورة لعائق معين، يستنى كام ثانية
-OBSTACLE_COOLDOWN_S = 5.0
+# cooldown بين صورة وصورة لنفس الـ label في الكاميرا
+CAMERA_COOLDOWN_S = 3.0
 
-# cooldown للبيئة — ما يسجلش نفس البيئة كتير
-ENV_COOLDOWN_S = 15.0
+# cooldown بين event وعائق لنفس الـ label في Ultrasonic
+OBSTACLE_COOLDOWN_S = 10.0
 
-# minimum persistence frames قبل ما نحفظ
-MIN_SAVE_PERSISTENCE = 4
+# Excel columns
+EXCEL_HEADERS = [
+    "Obstacle #",
+    "Obstacle Name",
+    "Timestamp",
+    "DateTime",
+    "GPS Latitude",
+    "GPS Longitude",
+    "Environment",
+    "Image Path",
+]
 
-# monitor frequency
-MONITOR_HZ = 10
+# ──────────────────────────────────────────────
+#  GPS PLACEHOLDER
+#  ← هنا هتربط GPS لما يجي من الأردوينو
+#  في الـ Telemetry هتضيف: tel.gps_lat, tel.gps_lon
+# ──────────────────────────────────────────────
 
-# CSV headers
-MINE_CSV_HEADERS        = ["timestamp", "datetime", "confidence", "image_path"]
-OBSTACLE_CSV_HEADERS    = ["timestamp", "datetime", "label", "confidence",
-                           "threat_level", "approx_dist", "image_path"]
-ENVIRONMENT_CSV_HEADERS = ["timestamp", "datetime", "environment", "confidence"]  # ← جديد
+GPS_NOT_CONNECTED = "N/A"
 
 
 # ──────────────────────────────────────────────
@@ -77,55 +91,110 @@ ENVIRONMENT_CSV_HEADERS = ["timestamp", "datetime", "environment", "confidence"]
 # ──────────────────────────────────────────────
 
 @dataclass
-class MineRecord:
-    timestamp:   float = field(default_factory=time.time)
-    confidence:  float = 0.0
-    image_path:  str   = ""
-
-    def to_csv_row(self) -> list:
-        return [
-            f"{self.timestamp:.3f}",
-            datetime.fromtimestamp(self.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
-            f"{self.confidence:.2f}",
-            self.image_path,
-        ]
-
-
-@dataclass
-class ObstacleRecord:
-    timestamp:    float = field(default_factory=time.time)
+class ObstacleEvent:
+    obstacle_num: int   = 0
     label:        str   = ""
-    confidence:   float = 0.0
-    threat_level: str   = ""
-    approx_dist:  str   = ""
+    timestamp:    float = field(default_factory=time.time)
+    gps_lat:      str   = GPS_NOT_CONNECTED
+    gps_lon:      str   = GPS_NOT_CONNECTED
+    environment:  str   = "Unknown"
     image_path:   str   = ""
 
-    def to_csv_row(self) -> list:
+    def to_excel_row(self) -> list:
         return [
+            self.obstacle_num,
+            self.label,
             f"{self.timestamp:.3f}",
             datetime.fromtimestamp(self.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
-            self.label,
-            f"{self.confidence:.2f}",
-            self.threat_level,
-            self.approx_dist,
+            self.gps_lat,
+            self.gps_lon,
+            self.environment,
             self.image_path,
         ]
 
 
-@dataclass
-class EnvironmentRecord:
-    """سجل تصنيف البيئة — جديد في v2.0."""
-    timestamp:   float = field(default_factory=time.time)
-    environment: str   = ""
-    confidence:  float = 0.0
+# ──────────────────────────────────────────────
+#  EXCEL MANAGER
+# ──────────────────────────────────────────────
 
-    def to_csv_row(self) -> list:
-        return [
-            f"{self.timestamp:.3f}",
-            datetime.fromtimestamp(self.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
-            self.environment,
-            f"{self.confidence:.2f}",
-        ]
+class ExcelManager:
+    """بيتولى إنشاء وتحديث الـ Excel file للعوائق."""
+
+    def __init__(self, path: str):
+        self.path = path
+        self._lock = threading.Lock()
+        self._ensure_file()
+
+    def _ensure_file(self):
+        if os.path.exists(self.path):
+            return
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Obstacle Log"
+
+        # Header style
+        header_font   = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+        header_fill   = PatternFill("solid", start_color="1F4E79")
+        header_align  = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        thin_border   = Border(
+            left=Side(style="thin"), right=Side(style="thin"),
+            top=Side(style="thin"), bottom=Side(style="thin"),
+        )
+
+        col_widths = [12, 20, 15, 22, 15, 15, 18, 40]
+
+        for col_idx, (header, width) in enumerate(zip(EXCEL_HEADERS, col_widths), start=1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.font   = header_font
+            cell.fill   = header_fill
+            cell.alignment = header_align
+            cell.border = thin_border
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        ws.row_dimensions[1].height = 30
+        ws.freeze_panes = "A2"
+
+        wb.save(self.path)
+
+    def append_row(self, event: ObstacleEvent):
+        with self._lock:
+            try:
+                wb = load_workbook(self.path)
+                ws = wb.active
+
+                row_idx = ws.max_row + 1
+                row_data = event.to_excel_row()
+
+                data_font   = Font(name="Arial", size=10)
+                data_align  = Alignment(horizontal="center", vertical="center")
+                thin_border = Border(
+                    left=Side(style="thin"), right=Side(style="thin"),
+                    top=Side(style="thin"), bottom=Side(style="thin"),
+                )
+                # تلوين الصفوف بالتناوب
+                row_fill = PatternFill("solid", start_color="D6E4F0") \
+                    if row_idx % 2 == 0 else PatternFill("solid", start_color="FFFFFF")
+
+                for col_idx, value in enumerate(row_data, start=1):
+                    cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                    cell.font      = data_font
+                    cell.alignment = data_align
+                    cell.border    = thin_border
+                    cell.fill      = row_fill
+                    # الصورة تبقى left-aligned
+                    if col_idx == len(EXCEL_HEADERS):
+                        cell.alignment = Alignment(horizontal="left", vertical="center")
+
+                wb.save(self.path)
+
+            except Exception as e:
+                log.error(f"Excel write error: {e}")
+
+    def reset(self):
+        with self._lock:
+            if os.path.exists(self.path):
+                os.remove(self.path)
+        self._ensure_file()
 
 
 # ──────────────────────────────────────────────
@@ -135,11 +204,14 @@ class EnvironmentRecord:
 class MissionLogger:
     """
     يراقب:
-      - الأردوينو: لو metal_detected → يحفظ صورة + CSV row
-      - YOLO: لو عائق جديد ومش cooldown → يحفظ صورة + CSV row
-      - البيئة: لو تغيرت البيئة ومش cooldown → يسجل في CSV  ← جديد
+      1. الكاميرا: لو YOLO اكتشف object جديد → صورة في camera_detections
+         - لو نفس الـ object لسه موجود → مش بياخد صورة تانية
+         - بعد MAX_CAMERA_IMAGES صورة → بيمسح الأقدم أوتوماتيك
 
-    الـ cooldown بيمنع الاهتزاز من تسجيل نفس العائق/البيئة أكتر من مرة.
+      2. الـ Ultrasonic (placeholder): لما يشوف عائق →
+         صورة + Excel row في obstacle_events
+         - بياخد GPS من الأردوينو (لو موصل)
+         - بياخد البيئة الحالية من الـ vision
     """
 
     def __init__(
@@ -150,57 +222,60 @@ class MissionLogger:
         self.vision = vision
         self.bridge = bridge
 
-        self._running = False
+        self._running  = False
         self._thread: Optional[threading.Thread] = None
-        self._lock = threading.Lock()
+        self._lock     = threading.Lock()
 
-        # cooldown tracker: label → last save time
-        self._last_obstacle_save: dict = {}
+        # ── Camera tracking ──────────────────────
+        # label → آخر وقت حفظنا فيه
+        self._camera_last_save: dict  = {}
+        # label → هل لسه موجود في الـ frame
+        self._camera_active:    dict  = {}
+        self._camera_count:     int   = 0
 
-        # منع تسجيل نفس اللغم أكتر من مرة في ثانية واحدة
-        self._last_mine_time: float = 0.0
-        self._mine_cooldown_s: float = 2.0
+        # ── Obstacle tracking ────────────────────
+        self._obstacle_count:         int   = 0
+        self._obstacle_last_save:     dict  = {}  # label → last time
+        # ← PLACEHOLDER: لما البريدج يبعتلك إشارة Ultrasonic
+        # غيّر _ultrasonic_triggered() بالـ logic الحقيقي
+        self._ultrasonic_flag:        bool  = False
 
-        # ── Environment tracking ─────────────────
-        self._last_env_label:    str   = ""       # آخر بيئة اتسجلت
-        self._last_env_log_time: float = 0.0      # آخر وقت سجلنا فيه
+        # ── Arduino connection warning ────────────
+        # بنطبع رسالة الـ "not connected" مرة واحدة بس
+        self._arduino_warning_shown:  bool  = False
 
-        # stats
-        self._mine_count     = 0
-        self._obstacle_count = 0
-        self._env_count      = 0   # ← جديد
+        # ── Excel ────────────────────────────────
+        if not EXCEL_AVAILABLE:
+            log.warning("openpyxl not installed — Excel logging disabled. "
+                        "Run: pip install openpyxl")
+        self._excel: Optional[ExcelManager] = \
+            ExcelManager(OBSTACLE_EXCEL) if EXCEL_AVAILABLE else None
 
         self._setup_dirs()
+        log.info("MissionLogger v3.0 initialized")
 
     # ──────────────────────────────────────────
     #  SETUP
     # ──────────────────────────────────────────
 
     def _setup_dirs(self):
-        os.makedirs(MINE_DIR,        exist_ok=True)
-        os.makedirs(OBSTACLE_DIR,    exist_ok=True)
-        os.makedirs(ENVIRONMENT_DIR, exist_ok=True)   # ← جديد
-        self._init_csv(MINE_CSV,        MINE_CSV_HEADERS)
-        self._init_csv(OBSTACLE_CSV,    OBSTACLE_CSV_HEADERS)
-        self._init_csv(ENVIRONMENT_CSV, ENVIRONMENT_CSV_HEADERS)  # ← جديد
-
-    @staticmethod
-    def _init_csv(path: str, headers: list):
-        if not os.path.exists(path):
-            with open(path, "w", newline="", encoding="utf-8") as f:
-                writer = csv.writer(f)
-                writer.writerow(headers)
+        os.makedirs(CAMERA_DIR,   exist_ok=True)
+        os.makedirs(OBSTACLE_DIR, exist_ok=True)
+        self._camera_count = self._count_images(CAMERA_DIR)
+        log.info(f"Found {self._camera_count} existing camera images")
 
     # ──────────────────────────────────────────
     #  PUBLIC API
     # ──────────────────────────────────────────
 
     def start(self):
+        if self._running:
+            return
         self._running = True
         self._thread  = threading.Thread(
             target=self._monitor_loop,
             daemon=True,
-            name="MissionLogger"
+            name="MissionLogger",
         )
         self._thread.start()
         log.info("MissionLogger started")
@@ -209,65 +284,69 @@ class MissionLogger:
         self._running = False
         if self._thread:
             self._thread.join(timeout=2.0)
-        log.info("MissionLogger stopped")
+        log.info("MissionLogger stopped — "
+                 f"camera={self._camera_count}  obstacles={self._obstacle_count}")
 
     def stats(self) -> dict:
         return {
-            "mines_logged":        self._mine_count,
-            "obstacles_logged":    self._obstacle_count,
-            "environments_logged": self._env_count,          # ← جديد
-            "mine_dir_size":       self._dir_size_mb(MINE_DIR),
-            "obstacle_dir_size":   self._dir_size_mb(OBSTACLE_DIR),
-            "env_dir_size":        self._dir_size_mb(ENVIRONMENT_DIR),  # ← جديد
+            "camera_images":    self._camera_count,
+            "obstacles_logged": self._obstacle_count,
+            "camera_dir_mb":    self._dir_size_mb(CAMERA_DIR),
+            "obstacle_dir_mb":  self._dir_size_mb(OBSTACLE_DIR),
         }
 
+    def trigger_ultrasonic_obstacle(self, label: str = "obstacle"):
+        """
+        ← استدعي الـ method دي من الأردوينو بريدج لما الـ Ultrasonic يشوف عائق.
+        مثال في arduino_bridge.py:
+            if ultrasonic_front < THRESHOLD:
+                self._mission_logger.trigger_ultrasonic_obstacle(label="object")
+        """
+        with self._lock:
+            self._ultrasonic_flag  = True
+            self._ultrasonic_label = label
+
     # ──────────────────────────────────────────
-    #  CLEAR COMMANDS — يدوي بس
+    #  CLEAR
     # ──────────────────────────────────────────
 
-    def clear_mines(self):
-        self._print_clear_report("MINES", MINE_DIR)
-        self._clear_dir(MINE_DIR)
-        self._init_csv(MINE_CSV, MINE_CSV_HEADERS)
-        self._mine_count = 0
-        print("✅ Mines log cleared.")
+    def clear_camera(self):
+        count = self._count_images(CAMERA_DIR)
+        size  = self._dir_size_mb(CAMERA_DIR)
+        self._clear_dir_images(CAMERA_DIR)
+        self._camera_count = 0
+        self._camera_last_save.clear()
+        self._camera_active.clear()
+        log.info(f"Camera log cleared — was {count} images ({size:.1f} MB)")
 
     def clear_obstacles(self):
-        self._print_clear_report("OBSTACLES", OBSTACLE_DIR)
-        self._clear_dir(OBSTACLE_DIR)
-        self._init_csv(OBSTACLE_CSV, OBSTACLE_CSV_HEADERS)
+        count = self._count_images(OBSTACLE_DIR)
+        size  = self._dir_size_mb(OBSTACLE_DIR)
+        self._clear_dir_images(OBSTACLE_DIR)
+        if self._excel:
+            self._excel.reset()
         self._obstacle_count = 0
-        self._last_obstacle_save.clear()
-        print("✅ Obstacles log cleared.")
-
-    def clear_environment(self):
-        """يمسح لوج البيئة — جديد في v2.0."""
-        self._print_clear_report("ENVIRONMENT", ENVIRONMENT_DIR)
-        self._clear_dir(ENVIRONMENT_DIR)
-        self._init_csv(ENVIRONMENT_CSV, ENVIRONMENT_CSV_HEADERS)
-        self._env_count      = 0
-        self._last_env_label = ""
-        print("✅ Environment log cleared.")
+        self._obstacle_last_save.clear()
+        log.info(f"Obstacle log cleared — was {count} images ({size:.1f} MB)")
 
     def clear_all(self):
-        self.clear_mines()
+        self.clear_camera()
         self.clear_obstacles()
-        self.clear_environment()   # ← جديد
-        print("✅ All logs cleared.")
+        log.info("All logs cleared")
 
     # ──────────────────────────────────────────
     #  MONITOR LOOP
     # ──────────────────────────────────────────
 
     def _monitor_loop(self):
-        interval = 1.0 / MONITOR_HZ
+        interval = 0.1  # 10 Hz
 
         while self._running:
             t0 = time.time()
             try:
                 self._tick()
             except Exception as e:
-                log.error(f"MissionLogger error: {e}", exc_info=True)
+                log.error(f"MissionLogger tick error: {e}", exc_info=True)
 
             elapsed = time.time() - t0
             sleep_t = interval - elapsed
@@ -275,241 +354,240 @@ class MissionLogger:
                 time.sleep(sleep_t)
 
     def _tick(self):
-        # ── فحص اللغم ────────────────────────
-        tel = self.bridge.get_telemetry()
-        if tel.metal_detected:
-            self._handle_mine(tel)
-
-        # ── فحص العائق ───────────────────────
+        # ── 1. Camera detection ───────────────
         result = self.vision.get_latest()
-        if self._should_log_obstacle(result):
-            self._handle_obstacle(result)
+        self._handle_camera(result)
 
-        # ── فحص البيئة ───────────────────────   ← جديد
-        env = self.vision.get_environment()
-        if self._should_log_environment(env):
-            self._handle_environment(env)
+        # ── 2. Ultrasonic obstacle ────────────
+        with self._lock:
+            triggered      = self._ultrasonic_flag
+            obstacle_label = getattr(self, "_ultrasonic_label", "obstacle")
+            self._ultrasonic_flag = False  # reset بعد ما قريناه
+
+        if triggered:
+            self._handle_obstacle_event(obstacle_label)
 
     # ──────────────────────────────────────────
-    #  MINE LOGGING
+    #  CAMERA LOGGING
     # ──────────────────────────────────────────
 
-    def _handle_mine(self, tel: Telemetry):
-        now = time.time()
-        if now - self._last_mine_time < self._mine_cooldown_s:
+    def _handle_camera(self, result: DetectionResult):
+        """
+        لو في detection:
+          - لو نفس الـ label لسه شايفه → ما يحفظش
+          - لو اختفى وجه تاني → يحفظ
+          - لو جديد تماماً → يحفظ
+        """
+        if not result.obstacle_found() or not result.is_valid(max_age=0.5):
+            # مفيش detection — نعمل reset للـ active labels
+            with self._lock:
+                self._camera_active.clear()
             return
 
-        self._last_mine_time = now
-        self._mine_count    += 1
-        log.info(f"MINE DETECTED #{self._mine_count}")
+        label = result.label
+        now   = time.time()
 
-        frame  = self.vision.get_raw_frame()
-        record = MineRecord(timestamp=now)
+        with self._lock:
+            was_active = self._camera_active.get(label, False)
+            self._camera_active[label] = True
+
+            if was_active:
+                # نفس الـ object لسه موجود — مش محتاج صورة
+                return
+
+            last_save = self._camera_last_save.get(label, 0.0)
+            if now - last_save < CAMERA_COOLDOWN_S:
+                return
+
+            self._camera_last_save[label] = now
+
+        frame = self.vision.get_raw_frame()
 
         threading.Thread(
-            target=self._save_mine_image,
-            args=(frame, record),
+            target=self._save_camera_image,
+            args=(frame, label, now),
             daemon=True,
-            name="MineSave"
+            name="CameraSave",
         ).start()
 
-    def _save_mine_image(self, frame, record: MineRecord):
+    def _save_camera_image(self, frame, label: str, timestamp: float):
         try:
-            ts   = datetime.fromtimestamp(record.timestamp).strftime("%Y%m%d_%H%M%S")
-            name = f"MINE_{ts}.jpg"
-            path = os.path.join(MINE_DIR, name)
+            ts   = datetime.fromtimestamp(timestamp).strftime("%Y%m%d_%H%M%S")
+            name = f"CAM_{ts}_{label}.jpg"
+            path = os.path.join(CAMERA_DIR, name)
 
             if frame is not None:
                 cv2.imwrite(path, frame)
-                record.image_path = path
-                log.info(f"Mine image saved: {path}")
+                self._camera_count += 1
+                log.debug(f"Camera image saved: {name} (total={self._camera_count})")
+                self._enforce_camera_limit()
             else:
-                log.warning("Mine detected but no frame available")
-                record.image_path = "NO_FRAME"
-
-            self._append_csv(MINE_CSV, record.to_csv_row())
+                log.debug(f"Camera detection ({label}) — no frame available")
 
         except Exception as e:
-            log.error(f"Failed to save mine image: {e}")
+            log.error(f"Camera save error: {e}")
+
+    def _enforce_camera_limit(self):
+        """لو بقى أكتر من MAX_CAMERA_IMAGES → امسح الأقدم."""
+        try:
+            images = sorted([
+                os.path.join(CAMERA_DIR, f)
+                for f in os.listdir(CAMERA_DIR)
+                if f.lower().endswith((".jpg", ".jpeg", ".png"))
+            ])
+
+            while len(images) > MAX_CAMERA_IMAGES:
+                oldest = images.pop(0)
+                os.remove(oldest)
+                log.debug(f"Auto-deleted old camera image: {os.path.basename(oldest)}")
+
+        except Exception as e:
+            log.error(f"Camera limit enforcement error: {e}")
 
     # ──────────────────────────────────────────
-    #  OBSTACLE LOGGING
+    #  OBSTACLE EVENT LOGGING
     # ──────────────────────────────────────────
 
-    def _should_log_obstacle(self, result: DetectionResult) -> bool:
-        if not result.obstacle_found():
-            return False
-        if not result.is_valid(max_age=0.5):
-            return False
-        if not result.persistent:
-            return False
-
+    def _handle_obstacle_event(self, label: str):
+        """
+        بيتفعل لما الـ Ultrasonic يشوف عائق.
+        بياخد: صورة + GPS + بيئة → يحفظ في obstacle_events
+        """
         now = time.time()
-        last_save = self._last_obstacle_save.get(result.label, 0.0)
+
+        # cooldown للـ label ده
+        last_save = self._obstacle_last_save.get(label, 0.0)
         if now - last_save < OBSTACLE_COOLDOWN_S:
-            return False
+            return
 
-        return True
-
-    def _handle_obstacle(self, result: DetectionResult):
-        now = time.time()
-        with self._lock:
-            self._last_obstacle_save[result.label] = now
-
+        self._obstacle_last_save[label] = now
         self._obstacle_count += 1
+        num = self._obstacle_count
+
+        # GPS
+        gps_lat, gps_lon = self._get_gps()
+
+        # البيئة الحالية
+        env = self.vision.get_environment()
+        env_label = env.label if env and env.label not in ("", "Unknown") else "Unknown"
+
+        # اسم العائق من الـ YOLO لو موجود
+        yolo_result = self.vision.get_latest()
+        if yolo_result.obstacle_found() and yolo_result.is_valid(max_age=1.0):
+            obstacle_name = yolo_result.label
+        else:
+            obstacle_name = label  # fallback للـ label اللي جاء من الـ Ultrasonic
+
         log.info(
-            f"OBSTACLE LOG #{self._obstacle_count} | "
-            f"label={result.label} conf={result.confidence:.0%} "
-            f"threat={result.threat_level}"
+            f"OBSTACLE EVENT #{num} | name={obstacle_name} | "
+            f"env={env_label} | GPS=({gps_lat}, {gps_lon})"
         )
 
-        frame  = self.vision.get_raw_frame()
-        record = ObstacleRecord(
+        frame = self.vision.get_raw_frame()
+
+        event = ObstacleEvent(
+            obstacle_num = num,
+            label        = obstacle_name,
             timestamp    = now,
-            label        = result.label,
-            confidence   = result.confidence,
-            threat_level = result.threat_level,
-            approx_dist  = result.approx_dist,
+            gps_lat      = gps_lat,
+            gps_lon      = gps_lon,
+            environment  = env_label,
         )
 
         threading.Thread(
-            target=self._save_obstacle_image,
-            args=(frame, record),
+            target=self._save_obstacle_event,
+            args=(frame, event),
             daemon=True,
-            name="ObstacleSave"
+            name="ObstacleSave",
         ).start()
 
-    def _save_obstacle_image(self, frame, record: ObstacleRecord):
+    def _save_obstacle_event(self, frame, event: ObstacleEvent):
         try:
-            ts   = datetime.fromtimestamp(record.timestamp).strftime("%Y%m%d_%H%M%S")
-            name = f"OBS_{ts}_{record.label}_{record.threat_level}.jpg"
+            ts   = datetime.fromtimestamp(event.timestamp).strftime("%Y%m%d_%H%M%S")
+            name = f"OBS_{event.obstacle_num:04d}_{ts}_{event.label}.jpg"
             path = os.path.join(OBSTACLE_DIR, name)
 
             if frame is not None:
                 cv2.imwrite(path, frame)
-                record.image_path = path
-                log.info(f"Obstacle image saved: {path}")
+                event.image_path = path
+                log.debug(f"Obstacle image saved: {name}")
             else:
-                record.image_path = "NO_FRAME"
+                event.image_path = "NO_FRAME"
+                log.warning(f"Obstacle #{event.obstacle_num} — no frame available")
 
-            self._append_csv(OBSTACLE_CSV, record.to_csv_row())
+            # Excel
+            if self._excel:
+                self._excel.append_row(event)
+            else:
+                log.warning("Excel not available — obstacle logged without Excel row")
 
         except Exception as e:
-            log.error(f"Failed to save obstacle image: {e}")
+            log.error(f"Obstacle event save error: {e}")
 
     # ──────────────────────────────────────────
-    #  ENVIRONMENT LOGGING  ← جديد في v2.0
+    #  GPS HELPER
     # ──────────────────────────────────────────
 
-    def _should_log_environment(self, env: EnvironmentResult) -> bool:
+    def _get_gps(self) -> Tuple[str, str]:
         """
-        يسجل البيئة لو:
-          1. الـ label مش Unknown
-          2. الـ result مش قديم (أقل من 10 ثواني)
-          3. البيئة اتغيرت عن آخر مسجل  OR  فات cooldown
+        ← PLACEHOLDER: هنا هتجيب الـ GPS من الـ Telemetry
+        لما تضيف GPS للـ Telemetry في arduino_bridge.py:
+            tel = self.bridge.get_telemetry()
+            return str(tel.gps_lat), str(tel.gps_lon)
         """
-        if env.label in ("Unknown", ""):
-            return False
-
-        if not env.is_valid(max_age=10.0):
-            return False
-
-        now = time.time()
-
-        # تغيرت البيئة → سجل فوراً (لو فاتت ثانية على الأقل من آخر تسجيل)
-        if env.label != self._last_env_label:
-            if now - self._last_env_log_time >= 1.0:
-                return True
-
-        # نفس البيئة لكن فات الـ cooldown → سجل تأكيداً دورياً
-        if now - self._last_env_log_time >= ENV_COOLDOWN_S:
-            return True
-
-        return False
-
-    def _handle_environment(self, env: EnvironmentResult):
-        now = time.time()
-
-        changed = (env.label != self._last_env_label)
-
-        with self._lock:
-            self._last_env_label    = env.label
-            self._last_env_log_time = now
-
-        self._env_count += 1
-
-        if changed:
-            log.info(
-                f"ENV CHANGE #{self._env_count} | "
-                f"{env.label}  conf={env.confidence:.0%}"
-            )
-        else:
-            log.debug(
-                f"ENV PERIODIC #{self._env_count} | "
-                f"{env.label}  conf={env.confidence:.0%}"
-            )
-
-        record = EnvironmentRecord(
-            timestamp   = now,
-            environment = env.label,
-            confidence  = env.confidence,
-        )
-        # CSV فقط — مفيش صورة للبيئة
-        self._append_csv(ENVIRONMENT_CSV, record.to_csv_row())
-
-    # ──────────────────────────────────────────
-    #  CSV HELPER
-    # ──────────────────────────────────────────
-
-    def _append_csv(self, path: str, row: list):
         try:
-            with self._lock:
-                with open(path, "a", newline="", encoding="utf-8") as f:
-                    csv.writer(f).writerow(row)
-        except Exception as e:
-            log.error(f"CSV write error: {e}")
+            tel = self.bridge.get_telemetry()
+
+            # ← لما تضيف GPS للـ Telemetry uncommint الـ lines دول:
+            # if hasattr(tel, 'gps_lat') and tel.gps_lat is not None:
+            #     return str(tel.gps_lat), str(tel.gps_lon)
+
+            # Arduino مش موصل أو مفيش GPS — رسالة واحدة بس
+            if not self._arduino_warning_shown:
+                log.warning("Arduino not connected — GPS will be logged as N/A")
+                self._arduino_warning_shown = True
+
+            return GPS_NOT_CONNECTED, GPS_NOT_CONNECTED
+
+        except Exception:
+            if not self._arduino_warning_shown:
+                log.warning("Arduino not connected — GPS will be logged as N/A")
+                self._arduino_warning_shown = True
+            return GPS_NOT_CONNECTED, GPS_NOT_CONNECTED
 
     # ──────────────────────────────────────────
-    #  CLEAR HELPERS
+    #  HELPERS
     # ──────────────────────────────────────────
 
     @staticmethod
-    def _print_clear_report(name: str, directory: str):
-        images = [
-            f for f in os.listdir(directory)
-            if f.lower().endswith((".jpg", ".jpeg", ".png", ".csv"))
-        ] if os.path.exists(directory) else []
-
-        size_mb = MissionLogger._dir_size_mb(directory)
-        print(f"\n{'='*40}")
-        print(f"  {name} CLEAR REPORT")
-        print(f"{'='*40}")
-        print(f"  Files   : {len(images)}")
-        print(f"  Size    : {size_mb:.1f} MB")
-        print(f"  Dir     : {directory}")
-        print(f"{'='*40}\n")
+    def _count_images(directory: str) -> int:
+        if not os.path.exists(directory):
+            return 0
+        return sum(
+            1 for f in os.listdir(directory)
+            if f.lower().endswith((".jpg", ".jpeg", ".png"))
+        )
 
     @staticmethod
-    def _clear_dir(directory: str):
+    def _clear_dir_images(directory: str):
         if not os.path.exists(directory):
             return
         for f in os.listdir(directory):
-            path = os.path.join(directory, f)
-            try:
-                if os.path.isfile(path):
-                    os.remove(path)
-            except Exception as e:
-                log.warning(f"Could not delete {path}: {e}")
+            if f.lower().endswith((".jpg", ".jpeg", ".png", ".xlsx")):
+                try:
+                    os.remove(os.path.join(directory, f))
+                except Exception as e:
+                    log.warning(f"Could not delete {f}: {e}")
 
     @staticmethod
     def _dir_size_mb(directory: str) -> float:
         if not os.path.exists(directory):
             return 0.0
-        total = 0
-        for f in os.listdir(directory):
-            fp = os.path.join(directory, f)
-            if os.path.isfile(fp):
-                total += os.path.getsize(fp)
+        total = sum(
+            os.path.getsize(os.path.join(directory, f))
+            for f in os.listdir(directory)
+            if os.path.isfile(os.path.join(directory, f))
+        )
         return total / (1024 * 1024)
 
 
@@ -518,15 +596,16 @@ class MissionLogger:
 # ──────────────────────────────────────────────
 
 if __name__ == "__main__":
+    import logging
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(name)s] %(levelname)s — %(message)s"
+        format="%(asctime)s [%(name)s] %(levelname)s — %(message)s",
     )
 
     from arduino_bridge import create_bridge
 
     print("=" * 60)
-    print("  MissionLogger v2.0 — Simulation Test")
+    print("  MissionLogger v3.0 — Simulation Test")
     print("=" * 60)
 
     bridge = create_bridge(simulate=True)
@@ -538,65 +617,56 @@ if __name__ == "__main__":
     logger = MissionLogger(vision, bridge)
     logger.start()
 
-    # Scenario 1: اكتشاف لغم
-    print("\n[SIM] Scenario 1: Mine detected")
-    bridge._latest_tel.metal_detected = True
-    time.sleep(1)
-    bridge._latest_tel.metal_detected = False
-    time.sleep(1)
-    print(f"  Mines logged: {logger._mine_count}")
-
-    # Scenario 2: عائق اتشاف
-    print("\n[SIM] Scenario 2: Obstacle detected")
+    # ── Test 1: Camera detection ──────────────
+    print("\n[TEST 1] Camera detection — same object repeated")
     vision._latest_result = DetectionResult(
-        position     = "FORWARD",
-        label        = "chair",
-        confidence   = 0.87,
-        threat_level = "MEDIUM",
-        approx_dist  = "CLOSE",
-        persistent   = True,
-        timestamp    = time.time(),
+        position="FORWARD", label="bottle",
+        confidence=0.85, threat_level="LOW",
+        approx_dist="MEDIUM", persistent=True,
+        timestamp=time.time(),
     )
-    time.sleep(1)
+    time.sleep(1.5)
+    # نفس الـ object لسه موجود — مش المفروض ياخد صورة تانية
+    time.sleep(1.5)
+    vision._latest_result = DetectionResult()  # اختفى
+    time.sleep(0.5)
+    # ظهر تاني — المفروض ياخد صورة جديدة
+    vision._latest_result = DetectionResult(
+        position="FORWARD", label="bottle",
+        confidence=0.80, threat_level="LOW",
+        approx_dist="MEDIUM", persistent=True,
+        timestamp=time.time(),
+    )
+    time.sleep(1.0)
     vision._latest_result = DetectionResult()
-    time.sleep(1)
-    print(f"  Obstacles logged: {logger._obstacle_count}")
+    print(f"  Camera images: {logger._camera_count} (expected: 2)")
 
-    # Scenario 3: تغيير البيئة  ← جديد
-    print("\n[SIM] Scenario 3: Environment change")
-    from vision_processor import EnvironmentResult
-    vision._env_classifier._latest_env = EnvironmentResult(
-        label="Open Field", confidence=0.82
-    )
-    time.sleep(2)
-    vision._env_classifier._latest_env = EnvironmentResult(
-        label="Desert", confidence=0.75
-    )
-    time.sleep(2)
-    print(f"  Environments logged: {logger._env_count}")
+    # ── Test 2: Ultrasonic trigger ────────────
+    print("\n[TEST 2] Ultrasonic obstacle trigger")
+    logger.trigger_ultrasonic_obstacle(label="wall")
+    time.sleep(0.5)
+    print(f"  Obstacles logged: {logger._obstacle_count} (expected: 1)")
 
-    # Scenario 4: اهتزاز — نفس العائق كتير ورا بعض
-    print("\n[SIM] Scenario 4: Vibration — same obstacle repeated fast")
-    for _ in range(5):
-        vision._latest_result = DetectionResult(
-            position="FORWARD", label="bottle",
-            confidence=0.75, threat_level="LOW",
-            approx_dist="MEDIUM", persistent=True,
-            timestamp=time.time(),
-        )
-        time.sleep(0.3)
-    time.sleep(1)
-    print(f"  Should be 1 save only (cooldown): obstacles={logger._obstacle_count}")
+    # ── Test 3: Ultrasonic cooldown ───────────
+    print("\n[TEST 3] Ultrasonic cooldown — same obstacle twice fast")
+    logger.trigger_ultrasonic_obstacle(label="wall")
+    time.sleep(0.3)
+    logger.trigger_ultrasonic_obstacle(label="wall")
+    time.sleep(0.5)
+    print(f"  Obstacles logged: {logger._obstacle_count} (expected: still 1)")
 
-    # Stats
+    # ── Stats ─────────────────────────────────
     print(f"\n  Stats: {logger.stats()}")
 
-    # Clear report
-    print("\n[SIM] Testing clear report:")
+    # ── Clear ────────────────────────────────
+    print("\n[TEST 4] Clear all")
     logger.clear_all()
+    print(f"  After clear — Stats: {logger.stats()}")
 
-    print("=" * 60)
     logger.stop()
     vision.stop()
     bridge.stop()
-    print("\nDone ✅")
+
+    print("\n" + "=" * 60)
+    print("  Done ✅")
+    print("=" * 60)
