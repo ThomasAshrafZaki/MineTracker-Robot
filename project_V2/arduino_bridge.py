@@ -14,6 +14,9 @@
         'm' = Manual mode      'R' = Reset all
         'u' = Speed up         'd' = Speed down
         'p' = Pause/Resume
+        'H' = Human Safety Stop (من human_safety.py فقط — فعّالة في AUTO mode
+              بس على مستوى الأردوينو؛ منفصلة عن 's' العادي ومتعارضتش مع
+              أوامر الموقع a/m/f/b/l/r خالص)
       Parameter commands:
         'w <val>' = sweepWidth     'h <val>' = sweepHeight
         'W <val>' = carWidth       'L <val>' = lineWidth
@@ -98,12 +101,13 @@ class ArduinoBridge:
 
     def __init__(
         self,
-        port:            str  = "/dev/ttyUSB0",
-        baud:            int  = BAUD_RATE,
-        auto_detect:     bool = True,
-        on_telemetry:    Optional[Callable[[Telemetry], None]] = None,
-        on_metal_detect: Optional[Callable[[], None]]         = None,
-        on_disconnect:   Optional[Callable[[], None]]         = None,
+        port:              str  = "/dev/ttyUSB0",
+        baud:              int  = BAUD_RATE,
+        auto_detect:       bool = True,
+        on_telemetry:      Optional[Callable[[Telemetry], None]] = None,
+        on_metal_detect:   Optional[Callable[[], None]]         = None,
+        on_disconnect:     Optional[Callable[[], None]]         = None,
+        on_obstacle_front: Optional[Callable[[], None]]         = None,
     ):
         self.port        = port
         self.baud        = baud
@@ -112,6 +116,7 @@ class ArduinoBridge:
         self._on_telemetry  = on_telemetry
         self._on_metal      = on_metal_detect
         self._on_disconnect = on_disconnect
+        self._on_obstacle_front = on_obstacle_front
 
         self._serial: Optional[serial.Serial] = None
         self._lock       = threading.Lock()
@@ -129,6 +134,20 @@ class ArduinoBridge:
         self._rx_count     = 0
         self._tx_count     = 0
         self._parse_errors = 0
+
+        # ── Log-spam guards ──────────────────────
+        # بتمنع تكرار رسائل "مش متصل" كل دورة retry (كل 2 ثانية) أو كل أمر TX.
+        # بترجع False تاني أول ما الاتصال يرجع، عشان لو الانقطاع يتكرر تاني نتنبه.
+        self._disconnect_logged = False
+        self._tx_dropped_logged = False
+
+        # ── Obstacle-front signal debounce ──────────
+        # حماية دفاعية ضد تكرار حرف 'O' بسبب نويز/تكرار في الترانسميشن.
+        # مش بديل عن cooldown الـ MissionLogger (10 ثواني) — ده أقصر
+        # بكتير وهدفه بس يمنع استدعاءين للـ callback لنفس الحدث الفعلي
+        # الواحد لو وصل سطر "O" مكرر بالغلط على مستوى السيريال.
+        self._last_obstacle_signal_time = 0.0
+        self._OBSTACLE_SIGNAL_MIN_GAP_S = 0.5
 
     # ── PUBLIC API ──────────────────────────────
 
@@ -209,6 +228,30 @@ class ArduinoBridge:
     def send_rotate_left(self):  self._enqueue('l')
     def send_rotate_right(self): self._enqueue('r')
     def send_stop(self):         self._enqueue('s')
+
+    def send_human_stop(self):
+        """
+        إشارة إيقاف خاصة بكشف الإنسان (Computer Vision / human_safety.py).
+        منفصلة تماماً عن send_stop() العادي:
+          - send_stop() ('s')  → إيقاف عام، بيشتغل في AUTO و MANUAL (زر/أمر يدوي).
+          - send_human_stop() ('H') → بتتفعل في الأردوينو في وضع AUTO فقط،
+            ومش بتتعارض مع أوامر الموقع (a/m/f/b/l/r) خالص.
+        ينفع تتنادى بشكل متكرر (مثلاً كل tick من HumanSafetyMonitor) من غير قلق،
+        لأن الـ throttling الخاص باللوج موجود جوه الـ bridge مش هنا.
+        """
+        self._enqueue('H')
+
+    def send_sign_stop(self):
+        """
+        إشارة إيقاف مستقلة خاصة بكشف لوحات الخطر (sign_detector.py).
+        بتبعت حرف '!' — مستقل تماماً عن send_human_stop() ('H')، بفلاج
+        ومنطق Watchdog خاص بيه في الأردوينو (zegzag_code_h.ino: signStopFlag /
+        ENABLE_SIGN_STOP). تفعيل/تعطيل تأثيرها على العربية بيتحكم فيه من
+        الأردوينو نفسه بسطر واحد (#define ENABLE_SIGN_STOP) — مفيش أي
+        تحكم أو فلاج جوه ملفات البايثون.
+        """
+        self._enqueue('!')
+
     def send_auto(self):         self._enqueue('a')
     def send_manual(self):       self._enqueue('m')
     def send_reset(self):        self._enqueue('R')
@@ -260,7 +303,9 @@ class ArduinoBridge:
                 self.port = port
                 log.info(f"Auto-detected Arduino on {port}")
             else:
-                log.warning("Arduino not found — running in simulation mode.")
+                if not self._disconnect_logged:
+                    log.warning("Arduino not connected — will keep retrying silently in the background.")
+                    self._disconnect_logged = True
                 self._connected = False
                 return False
 
@@ -274,10 +319,17 @@ class ArduinoBridge:
             time.sleep(2.0)
             self._serial.reset_input_buffer()
             self._connected = True
-            log.info(f"Connected to Arduino on {port} @ {self.baud} baud")
+            log.info(f"Arduino connected ✓ — port={port} @ {self.baud} baud")
+            # نصفّر الـ guards عشان لو الاتصال اتقطع تاني نتنبه من جديد
+            self._disconnect_logged = False
+            self._tx_dropped_logged = False
             return True
         except serial.SerialException as e:
-            log.error(f"Failed to open {port}: {e}")
+            if not self._disconnect_logged:
+                log.warning(f"Arduino not connected ({port}) — will keep retrying silently in the background.")
+                self._disconnect_logged = True
+            else:
+                log.debug(f"Retry failed to open {port}: {e}")
             self._connected = False
             return False
 
@@ -318,6 +370,33 @@ class ArduinoBridge:
 
                 line = raw.decode("utf-8", errors="replace").strip()
                 if not line:
+                    continue
+
+                # ── إشارة عائق أمامي من الأردوينو (Serial1.println("O")) ──
+                # لازم نمسكها هنا *قبل* _parse_telemetry، وإلا هتدخل
+                # _try_parse_ultrasonic (مش بادئة بـ "U:" فهترجع None
+                # بهدوء) أو تتسجل كـ parse error في _parse_telemetry لو
+                # كانت أقصر من 4 أجزاء — في الحالتين كانت هتتسجل غلط أو
+                # تتجاهل بصمت من غير ما تشغّل الـ callback المطلوب.
+                #
+                # دفاع إضافي (مستقل عن الـ obstacleSignalSent flag اللي
+                # في الأردوينو نفسه): لو وصلت أكتر من 'O' خلال أقل من
+                # نص ثانية، نتجاهل التكرار. ده مش بديل عن الـ cooldown
+                # الحقيقي بتاع MissionLogger (10 ثواني، بيمنع تسجيل نفس
+                # العائق مرتين في الإكسل) — ده بس حماية من نويز/تكرار
+                # على مستوى السيريال نفسه (سطر اتكرر بالغلط في الترانسميشن).
+                if line == "O":
+                    now = time.time()
+                    if (now - self._last_obstacle_signal_time) > self._OBSTACLE_SIGNAL_MIN_GAP_S:
+                        self._last_obstacle_signal_time = now
+                        log.info("Obstacle-front signal received from Arduino ('O')")
+                        if self._on_obstacle_front:
+                            try:
+                                self._on_obstacle_front()
+                            except Exception as cb_err:
+                                log.error(f"on_obstacle_front callback error: {cb_err}")
+                    else:
+                        log.debug("Duplicate 'O' signal within debounce window — ignored")
                     continue
 
                 tel = self._parse_telemetry(line)
@@ -416,7 +495,12 @@ class ArduinoBridge:
                 continue
 
             if not self._connected or not self._serial or not self._serial.is_open:
-                log.warning(f"TX dropped (not connected): {repr(cmd)}")
+                if not self._tx_dropped_logged:
+                    log.warning(
+                        f"Sending commands (e.g. {repr(cmd)}) — "
+                        "Arduino not connected, commands will be dropped silently until it reconnects."
+                    )
+                    self._tx_dropped_logged = True
                 continue
 
             try:
@@ -436,7 +520,9 @@ class ArduinoBridge:
             log.warning(f"TX queue full — dropping: {repr(cmd)}")
 
     def _try_reconnect(self):
-        log.info(f"Attempting reconnect to {self.port}...")
+        # debug مش info — عشان متتكررش الرسالة دي كل RECONNECT_DELAY_S للأبد
+        # في اللوج. رسالة "مش متصل" الموحّدة بتتطبع مرة واحدة من _connect().
+        log.debug(f"Retrying connection to {self.port}...")
         time.sleep(RECONNECT_DELAY_S)
         if self._serial:
             try:
@@ -490,6 +576,18 @@ class SimulatedArduinoBridge(ArduinoBridge):
         self._sim_y        = 0.0
         self._last_cmd     = ""
 
+        # ── Synthetic obstacle-front trigger (للاختبار بدون هاردوير) ──
+        # بيتفعل كل SIM_OBSTACLE_EVERY_S تقريباً، عشان تقدر تتأكد إن
+        # سلسلة MissionLogger كاملة (صورة + GPS placeholder + بيئة +
+        # صف إكسل) شغالة صح وانت بتشغّل main.py --simulate من غير
+        # الأردوينو ولا الـ Ultrasonic الحقيقي متوصلين.
+        # ده منفصل تماماً عن أي منطق bypass حقيقي — هنا بس بيستدعي نفس
+        # الـ on_obstacle_front callback اللي كان هيتنادى من سطر 'O'
+        # الحقيقي، فمفيش فرق من وجهة نظر MissionLogger.
+        self._sim_obstacle_elapsed = 0.0
+
+    SIM_OBSTACLE_EVERY_S = 15.0   # كل كام ثانية simulation-time نبعت عائق وهمي
+
     def start(self) -> bool:
         self._running   = True
         self._connected = True
@@ -524,6 +622,17 @@ class SimulatedArduinoBridge(ArduinoBridge):
             self._sim_angle = (self._sim_angle + random.gauss(0, 0.2)) % 360
             self._sim_x    += 0.001 * math.cos(math.radians(self._sim_angle))
             self._sim_y    += 0.001 * math.sin(math.radians(self._sim_angle))
+
+            # ── Synthetic obstacle-front event (اختبار فقط) ──
+            self._sim_obstacle_elapsed += 0.1
+            if self._sim_obstacle_elapsed >= self.SIM_OBSTACLE_EVERY_S:
+                self._sim_obstacle_elapsed = 0.0
+                if self._on_obstacle_front:
+                    try:
+                        log.info("[SIM] Synthetic obstacle-front event")
+                        self._on_obstacle_front()
+                    except Exception as cb_err:
+                        log.error(f"on_obstacle_front callback error (sim): {cb_err}")
 
             tel = Telemetry(
                 timestamp=time.time(),

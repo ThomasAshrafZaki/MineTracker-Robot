@@ -91,12 +91,16 @@ log = logging.getLogger("SignDetectorV2")
 HSV_RED_1 = (np.array([0,   90,  60]),  np.array([10,  255, 255]))
 HSV_RED_2 = (np.array([165, 90,  60]),  np.array([180, 255, 255]))
 
-# البرتقالي الفوسفوري — موسّع قليلاً
+# البرتقالي الفوسفوري IMAS
 HSV_ORANGE_IMAS = (np.array([11, 140, 100]), np.array([22, 255, 255]))
 
+# الأصفر IMAS (جمجمة، DANGER، لوحات تحذير صفرا) — target مش reject
+# نطاق ضيق عشان يرفض الأصفر الباهت (ملابس، خلفيات)
+HSV_YELLOW_IMAS = (np.array([23, 130, 100]), np.array([38, 255, 255]))
+
 # Rejection masks — بيرفض الألوان دي لو كانت غالبة
-HSV_SKIN_REJECT   = (np.array([5, 30, 140]),  np.array([20, 120, 255]))  # لون الجلد
-HSV_YELLOW_REJECT = (np.array([23, 100, 100]), np.array([35, 255, 255])) # أصفر (ملابس عمال)
+HSV_SKIN_REJECT   = (np.array([0,  20, 100]),  np.array([25, 150, 255]))  # جلد — موسّع لكل درجات البشرة
+# Yellow REJECT اتنقل لـ target — ما بنرفضوش دلوقتي
 HSV_PINK_REJECT   = (np.array([160, 30, 150]), np.array([170, 120, 255])) # وردي فاتح
 
 COLOR_MIN_PIXEL_RATIO = 0.004  # مخفّض — لوحات صغيرة أو بعيدة تعدي
@@ -118,7 +122,7 @@ SHAPE_ASPECT_MIN     = 0.45    # أوسع نطاق للـ aspect ratio
 SHAPE_ASPECT_MAX     = 1.80
 
 # الشكل لازم يكون مثلث (3 أضلاع) أو مضلع قريب (4-6 أضلاع)
-SHAPE_ACCEPTED_VERTICES = (3, 4, 5, 6)
+SHAPE_ACCEPTED_VERTICES = (3, 4)   # مثلث (3) بس، 4 كـ tolerance للكاميرا
 
 # Convexity مخفّف — اللوحات الحقيقية مش دايماً مثالية
 SHAPE_MIN_CONVEXITY  = 0.72
@@ -159,18 +163,16 @@ TEXTURE_MAX_EDGE_DENSITY  = 0.65   # مرفوع
 # ══════════════════════════════════════════════════════════
 
 TEMPORAL_WINDOW  = 12
-TEMPORAL_HITS    = 7
+TEMPORAL_HITS    = 5   # 5 من 12 فريم — أسرع في التأكيد (~170ms على 30fps)
 
 # بعد التأكيد: reset الـ history عشان الـ detection الجاي يبني من الصفر
 TEMPORAL_COOLDOWN_SEC = 3.0
 
 # لما اللوحة تختفي: عدد الفريمات المتتالية الفاشلة في Stage 1 قبل ما نمسح الـ danger
 # 20 فريم = ~670ms على 30fps — بيتجاهل الـ flicker العادي
-CLEAR_STREAK_NEEDED = 20
+CLEAR_STREAK_NEEDED = 12   # 12 فريم = ~400ms — كافي لتجاهل الـ flicker
 
-# الحد الأدنى للوقت اللي الـ danger_confirmed بيفضل active فيه بعد التأكيد
-# حتى لو Stage 1 فشلت فجأة (إضاءة، زاوية)، الـ danger مش بيروح قبل الوقت ده
-DANGER_MIN_HOLD_SEC = 2.0
+DANGER_MIN_HOLD_SEC = 1.0  # ثانية واحدة hold — بعدها بيتمسح بسرعة لما اللوحة تتشال
 
 
 # ══════════════════════════════════════════════════════════
@@ -299,19 +301,24 @@ class _ColorGate:
             h, w = frame.shape[:2]
             frame_area = h * w
 
-            hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+            # blur خفيف قبل الـ HSV عشان يثبت اللون لما الإضاءة تتغير
+            blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+            hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
             # --- بناء الـ target mask ---
             m_red1   = cv2.inRange(hsv, *HSV_RED_1)
             m_red2   = cv2.inRange(hsv, *HSV_RED_2)
             m_orange = cv2.inRange(hsv, *HSV_ORANGE_IMAS)
-            target_mask = cv2.bitwise_or(cv2.bitwise_or(m_red1, m_red2), m_orange)
+            m_yellow = cv2.inRange(hsv, *HSV_YELLOW_IMAS)
+            target_mask = cv2.bitwise_or(
+                cv2.bitwise_or(cv2.bitwise_or(m_red1, m_red2), m_orange),
+                m_yellow
+            )
 
             # --- بناء الـ rejection mask ---
-            m_skin   = cv2.inRange(hsv, *HSV_SKIN_REJECT)
-            m_yellow = cv2.inRange(hsv, *HSV_YELLOW_REJECT)
-            m_pink   = cv2.inRange(hsv, *HSV_PINK_REJECT)
-            reject_mask = cv2.bitwise_or(cv2.bitwise_or(m_skin, m_yellow), m_pink)
+            m_skin = cv2.inRange(hsv, *HSV_SKIN_REJECT)
+            m_pink = cv2.inRange(hsv, *HSV_PINK_REJECT)
+            reject_mask = cv2.bitwise_or(m_skin, m_pink)
 
             target_pixels = int(np.count_nonzero(target_mask))
             reject_pixels = int(np.count_nonzero(reject_mask))
@@ -346,6 +353,33 @@ class _ColorGate:
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
             clean_mask = cv2.morphologyEx(target_mask, cv2.MORPH_CLOSE, kernel, iterations=2)
             clean_mask = cv2.morphologyEx(clean_mask,  cv2.MORPH_OPEN,  kernel, iterations=1)
+
+            # --- Blob compactness check ---
+            # اللوحة = بقعة لون واحدة متجمعة
+            # الإنسان / الهدوم = لون متشتت في الفريم
+            # بنشوف إن أكبر blob فيه على الأقل 50% من كل الـ colored pixels
+            n_labels, _, stats, _ = cv2.connectedComponentsWithStats(clean_mask, connectivity=8)
+            if n_labels < 2:
+                return StageResult(
+                    passed=False, score=0,
+                    reason="No connected color region found after morphology",
+                ), None
+
+            # stats[0] = background، نبدأ من 1
+            component_areas = stats[1:, cv2.CC_STAT_AREA]
+            largest_blob    = int(component_areas.max())
+            total_colored_pixels = int(clean_mask.sum() // 255)
+
+            if total_colored_pixels == 0:
+                return StageResult(passed=False, score=0, reason="Empty mask after morphology"), None
+
+            compactness = largest_blob / total_colored_pixels
+            if compactness < 0.45:
+                # اللون متشتت → على الأغلب جلد أو هدوم مش لوحة
+                return StageResult(
+                    passed=False, score=0,
+                    reason=f"Color scattered (compactness={compactness:.2f} < 0.45) — not a sign",
+                ), None
 
             # --- Confidence score ---
             # أعلى نقطة لو النسبة في المنتصف (مش صغير جداً ولا كبير جداً)

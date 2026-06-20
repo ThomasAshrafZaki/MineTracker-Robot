@@ -925,6 +925,7 @@ class VisionProcessor:
         self._sign_frame              = None
         self._sign_ready              = threading.Event()
         self._sign_frame_lock         = threading.Lock()
+        self._sign_prev_danger        = False  # state-change logging فقط
 
         # GStreamer push pipeline to MediaMTX
         self._gst_pipeline = None
@@ -1271,12 +1272,19 @@ class VisionProcessor:
 
             try:
                 sign_result = self._sign_detector.process_frame(frame)
-                if sign_result.danger_confirmed:
+                danger_now  = sign_result.danger_confirmed
+
+                if danger_now and not self._sign_prev_danger:
                     log.warning(
                         f"[SignDetector] DANGER confirmed — "
                         f"reason={sign_result.reason} "
                         f"word='{sign_result.text_matched_word}'"
                     )
+                elif not danger_now and self._sign_prev_danger:
+                    log.info("[SignDetector] CLEAR — danger sign no longer detected")
+
+                self._sign_prev_danger = danger_now
+
             except Exception as e:
                 log.error(f"SignDetector process_frame error: {e}")
 
@@ -1515,19 +1523,19 @@ class VisionProcessor:
 
         if result.obstacle_found():
             if result.is_human:
-                status_text  = f"HUMAN DETECTED  conf={result.confidence:.0%}"
+                status_text  = f"DETECT HUMAN  conf={result.confidence:.0%}"
                 status_color = COLOR_HUMAN
             else:
                 appr = " ↑APPR" if result.is_approaching else ""
                 status_text  = (
-                    f"{result.label.upper()}  "
+                    f"DETECT {result.label.upper()}  "
                     f"{result.approx_dist}  "
                     f"[{result.threat_level}]  "
                     f"{result.confidence:.0%}{appr}"
                 )
                 status_color = threat_colors.get(result.threat_level, COLOR_CLEAR)
         else:
-            status_text  = "PATH CLEAR"
+            status_text  = "AREA CLEAR"
             status_color = COLOR_CLEAR
 
         cv2.putText(frame, status_text, (8, 22),
@@ -1546,22 +1554,22 @@ class VisionProcessor:
             cv2.FONT_HERSHEY_SIMPLEX, 0.36, COLOR_INFO, 1
         )
 
-        # 9. Environment bar
+        # 9. Environment bar (مكبّرة وأوضح بناءً على طلبك)
         env = self._env_classifier.get_latest()
-        env_bar_y1 = h - 44
-        env_bar_y2 = h - 23
+        env_bar_y1 = h - 50
+        env_bar_y2 = h - 22
 
-        cv2.rectangle(frame, (0, env_bar_y1), (w, env_bar_y2), (20, 20, 20), -1)
+        cv2.rectangle(frame, (0, env_bar_y1), (w, env_bar_y2), (25, 25, 25), -1)
 
         if env.label != "Unknown" and env.is_valid():
             env_text  = f"ENV: {env.label}  ({env.confidence:.0%})"
             env_color = COLOR_ENV
         else:
             env_text  = "ENV: Scanning..."
-            env_color = (120, 120, 120)
+            env_color = (150, 150, 150)
 
-        cv2.putText(frame, env_text, (8, env_bar_y2 - 4),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.38, env_color, 1)
+        cv2.putText(frame, env_text, (8, env_bar_y2 - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.52, env_color, 2)
 
         # 10. ── Sign Danger Banner ────────────────────────────────────
         #     بانر أحمر في وسط الشاشة لو فيه لوحة خطر متأكدة

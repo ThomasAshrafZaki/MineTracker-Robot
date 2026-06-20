@@ -95,62 +95,14 @@ def draw_hud(
 
     h, w = frame.shape[:2]
 
-    # ── bottom bar (70px) ─────────────────────
-    cv2.rectangle(frame, (0, h - 72), (w, h), _C_BLACK, -1)
-
-    # ultrasonic readings
-    f_color = _C_RED if us.front < 50 else _C_GREEN
-    cv2.putText(frame, f"F:{us.front:5.1f}cm",
-                (10, h - 48), cv2.FONT_HERSHEY_SIMPLEX, 0.62, f_color, 2)
-    cv2.putText(frame, f"L:{us.left:5.1f}cm",
-                (10, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.62, _C_WHITE, 1)
-    cv2.putText(frame, f"R:{us.right:5.1f}cm",
-                (185, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.62, _C_WHITE, 1)
-
-    # robot / safety state
-    safety_color = _C_RED if safety_state != "CLEAR" else _C_GREEN
-    state_label  = "STATE: PAUSED" if paused else "ARDUINO: AUTO"
-    sc           = _C_GRAY if paused else _C_GREEN
-    cv2.putText(frame, state_label,
-                (w // 2 - 85, h - 48), cv2.FONT_HERSHEY_SIMPLEX, 0.68, sc, 2)
-
-    # human safety state
-    cv2.putText(frame, f"SAFETY: {safety_state}",
-                (w // 2 - 85, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, safety_color, 1)
-
-    # stats top-right — أضفنا ENV count
-    cv2.putText(
-        frame,
-        f"MINES:{logger_stats.get('mines_logged', 0)}"
-        f"  OBS:{logger_stats.get('obstacles_logged', 0)}"
-        f"  ENV:{logger_stats.get('environments_logged', 0)}",
-        (w - 310, 22),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.44, _C_GRAY, 1
-    )
-
-    # logger disk usage
-    mine_mb = logger_stats.get("mine_dir_size", 0.0)
-    obs_mb  = logger_stats.get("obstacle_dir_size", 0.0)
-    cv2.putText(
-        frame,
-        f"LOG: mines={mine_mb:.1f}MB  obs={obs_mb:.1f}MB",
-        (w - 310, 44),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.42, _C_GRAY, 1
-    )
-
-    # ── Environment label ──────────────────────────────────
-    if env_label and env_label != "Unknown":
-        env_text  = f"ENV: {env_label}  ({env_conf:.0%})"
-        env_color = _C_ENV
-    else:
-        env_text  = "ENV: Scanning..."
-        env_color = _C_GRAY
-
-    cv2.putText(
-        frame, env_text,
-        (10, h - 90),
-        cv2.FONT_HERSHEY_SIMPLEX, 0.50, env_color, 1
-    )
+    # ملحوظة: شلنا من هنا نهائيًا (بناءً على طلبك):
+    #   - bottom bar (F/L/R ultrasonic + ARDUINO/STATE + SAFETY)
+    #   - stats top-right (MINES/OBS/ENV counts)
+    #   - LOG disk usage (mines/obs MB)
+    #   - الـ ENV label اللي كانت بتتكرر هنا (vision_processor.py
+    #     عنده بار ENV خاص بيه دلوقتي بقى واضح وموجود لوحده تحت)
+    #
+    # لو احتجت أي واحدة منهم ترجع تاني قولي وأنا أرجعها.
 
     # ── Sign danger banner ─────────────────────────────────
     if sign_danger:
@@ -196,11 +148,32 @@ def main():
     log.info(f"  env_classifier={not args.no_env}  sign_detector={not args.no_sign}")
     log.info("=" * 60)
 
+    # ── callback: عائق أمامي مكتشف بالـ Ultrasonic (حرف 'O' من الأردوينو) ──
+    #
+    # ⚠️ ملحوظة ترتيب مهمة: المتغير `logger` لسه مش معرّف وقت تعريف
+    # الدالة دي (هيتعرّف بعد كذا سطر تحت). ده آمن 100% بسبب late binding
+    # في بايثون: closures بتدور على الاسم `logger` في الـ enclosing scope
+    # وقت ما الدالة *بتتنفذ فعلياً*، مش وقت ما بتتعرّف. والدالة دي مش
+    # بتتنفذ إلا من جوه RX thread بتاع الـ bridge، واللي مش بيبدأ إلا
+    # عند `bridge.start()` تحت — وده بيحصل بعد تعريف `logger` بسطور.
+    # لو غيّرت ترتيب الكود وحركت `bridge.start()` لفوق تعريف `logger`،
+    # هتاخد NameError وقت أول إشارة 'O' — خليك واخد بالك من الترتيب ده.
+    #
+    # ملحوظة تانية: في --simulate، SimulatedArduinoBridge بيستخدم
+    # _sim_loop مش _rx_loop، فمفيش حرف 'O' حقيقي جاي من سيريال. عشان
+    # تقدر تتأكد إن باقي السلسلة (MissionLogger → صورة + GPS + بيئة +
+    # صف إكسل) شغالة صح من غير هاردوير، SimulatedArduinoBridge بقى فيه
+    # تريجر صناعي دوري لنفس الـ callback (راجع arduino_bridge.py).
+    def on_obstacle_front():
+        log.warning("OBSTACLE FRONT — Arduino detected obstacle ahead, triggering camera capture")
+        logger.trigger_ultrasonic_obstacle(label="obstacle")
+
     # ── build components ─────────────────────
     bridge = create_bridge(
         port=args.port,
         simulate=args.simulate,
         auto_detect=not args.simulate,
+        on_obstacle_front=on_obstacle_front,
     )
 
     vision = VisionProcessor(
@@ -215,10 +188,7 @@ def main():
 
     # callbacks للـ human safety
     def on_human_detected(event: HumanEvent):
-        log.warning(
-            f"HUMAN DETECTED | conf={event.confidence:.0%} | "
-            f"image={event.saved_path}"
-        )
+        log.warning(f"HUMAN DETECTED | conf={event.confidence:.0%}")
 
     def on_human_cleared(event: HumanEvent):
         log.info(f"AREA CLEAR | robot was stopped for {event.duration_s:.1f}s")
@@ -269,14 +239,23 @@ def main():
         while running[0]:
 
             # ── safety gate ──────────────────
+            # مهم: send_human_stop() ('H') مش send_stop() ('s') —
+            # عشان تتفعّل بس في AUTO mode على مستوى الأردوينو، ومتتعارضش
+            # مع أوامر الموقع (a/m/f/b/l/r) ولا مع 's' العام.
             if not safety.is_safe():
-                bridge.send_stop()
+                bridge.send_human_stop()
 
             # ── sign detector gate ────────────
+            # bridge.send_sign_stop() بتبعت '!' — حرف مستقل عن 'H' بتاع
+            # human_safety.py، مفيش أي تشارك بينهم. مش bridge.send_stop()
+            # ('s') لأنها بترجع Stop() لحظي بس من غير return من loop() في
+            # الأردوينو، يعني الزقزاق كان بيكمّل حركته فوقها في AUTO.
+            # تفعيل/تعطيل تأثيرها على العربية بيتحكم فيه من الأردوينو
+            # نفسه (#define ENABLE_SIGN_STOP) — مفيش أي فلاج هنا.
             if _use_sign:
                 sign = vision.get_latest_sign()
                 if sign is not None and sign.danger_confirmed:
-                    bridge.send_stop()
+                    bridge.send_sign_stop()
                     if hasattr(logger, "log_sign_danger"):
                         logger.log_sign_danger(sign.reason)
             else:

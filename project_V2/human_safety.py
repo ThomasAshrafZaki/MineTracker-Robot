@@ -12,7 +12,9 @@
   مش بيتدخل في الاتجاهات خالص
 
   Author  : Robot Team
-  Version : 1.0
+  Version : 1.1 — يستخدم send_human_stop() ('H') بدل send_stop() ('s')
+            عشان الإيقاف بسبب الإنسان يبقى منفصل تماماً عن أي إيقاف يدوي/عام
+            جاي من الموقع، ويشتغل في AUTO mode بس على مستوى الأردوينو.
 ================================================================================
 """
 
@@ -273,11 +275,18 @@ class HumanSafetyMonitor:
     # ──────────────────────────────────────────
 
     def _send_stop(self):
-        """يبعت STOP للأردوينو."""
+        """
+        يبعت إشارة إيقاف الإنسان للأردوينو عبر send_human_stop() ('H')
+        — مش send_stop() ('s') العادي.
+        التغيير ده مهم: 'H' بتتفعل في الأردوينو في وضع AUTO فقط، ومتعارضتش
+        مع 's' (إيقاف عام يدوي) ولا مع أوامر الموقع a/m/f/b/l/r خالص.
+        ينفع تتنادى بشكل متكرر (10Hz هنا) بدون قلق من سبام اللوج — التهدئة
+        موجودة جوه arduino_bridge.py نفسها (rate-limited logging).
+        """
         try:
-            self.bridge.send_stop()
+            self.bridge.send_human_stop()
         except Exception as e:
-            log.error(f"Failed to send STOP: {e}")
+            log.error(f"Failed to send Human-Stop signal: {e}")
 
 
 
@@ -296,7 +305,7 @@ class HumanSafetyMonitor:
 #  وفي loop بتاعت الـ decision_engine، قبل ما تبعت FORWARD:
 #
 #  if not safety.is_safe():
-#      bridge.send_stop()
+#      bridge.send_human_stop()
 #      continue
 #
 # ──────────────────────────────────────────────

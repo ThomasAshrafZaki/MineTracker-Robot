@@ -53,6 +53,7 @@ log = logging.getLogger("MissionLogger")
 # ──────────────────────────────────────────────
 
 CAMERA_DIR        = "logs/camera_detections"
+CAMERA_EXCEL      = os.path.join(CAMERA_DIR,   "camera_detections_log.xlsx")
 OBSTACLE_DIR      = "logs/obstacle_events"
 OBSTACLE_EXCEL    = os.path.join(OBSTACLE_DIR, "obstacles_log.xlsx")
 
@@ -65,7 +66,7 @@ CAMERA_COOLDOWN_S = 3.0
 # cooldown بين event وعائق لنفس الـ label في Ultrasonic
 OBSTACLE_COOLDOWN_S = 10.0
 
-# Excel columns
+# Obstacle Excel columns
 EXCEL_HEADERS = [
     "Obstacle #",
     "Obstacle Name",
@@ -75,6 +76,16 @@ EXCEL_HEADERS = [
     "GPS Longitude",
     "Environment",
     "Image Path",
+]
+
+# Camera Excel columns
+CAMERA_EXCEL_HEADERS = [
+    "Detection #",
+    "Detection Name",
+    "Timestamp",
+    "DateTime",
+    "Image Name",
+    "Environment",
 ]
 
 # ──────────────────────────────────────────────
@@ -89,6 +100,25 @@ GPS_NOT_CONNECTED = "N/A"
 # ──────────────────────────────────────────────
 #  DATA MODELS
 # ──────────────────────────────────────────────
+
+@dataclass
+class CameraDetectionEvent:
+    detection_num: int   = 0
+    label:         str   = ""
+    timestamp:     float = field(default_factory=time.time)
+    image_name:    str   = ""
+    environment:   str   = "Unknown"
+
+    def to_excel_row(self) -> list:
+        return [
+            self.detection_num,
+            self.label,
+            f"{self.timestamp:.3f}",
+            datetime.fromtimestamp(self.timestamp).strftime("%Y-%m-%d %H:%M:%S"),
+            self.image_name,
+            self.environment,
+        ]
+
 
 @dataclass
 class ObstacleEvent:
@@ -197,6 +227,91 @@ class ExcelManager:
         self._ensure_file()
 
 
+class CameraExcelManager:
+    """Excel log للـ camera detections — بيتراكم ومش بيتمسح منه صفوف."""
+
+    def __init__(self, path: str):
+        self.path  = path
+        self._lock = threading.Lock()
+        self._detection_count = 0
+        self._ensure_file()
+
+    def _ensure_file(self):
+        if os.path.exists(self.path):
+            # احسب عدد الصفوف الموجودة عشان الترقيم يكمل صح
+            try:
+                wb = load_workbook(self.path, read_only=True)
+                ws = wb.active
+                self._detection_count = max(0, ws.max_row - 1)
+                wb.close()
+            except Exception:
+                self._detection_count = 0
+            return
+
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "Camera Detections"
+
+        header_font  = Font(name="Arial", bold=True, color="FFFFFF", size=11)
+        header_fill  = PatternFill("solid", start_color="1A5276")
+        header_align = Alignment(horizontal="center", vertical="center", wrap_text=True)
+        thin_border  = Border(
+            left=Side(style="thin"), right=Side(style="thin"),
+            top=Side(style="thin"), bottom=Side(style="thin"),
+        )
+        col_widths = [14, 22, 15, 22, 35, 20]
+
+        for col_idx, (header, width) in enumerate(zip(CAMERA_EXCEL_HEADERS, col_widths), start=1):
+            cell = ws.cell(row=1, column=col_idx, value=header)
+            cell.font      = header_font
+            cell.fill      = header_fill
+            cell.alignment = header_align
+            cell.border    = thin_border
+            ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+        ws.row_dimensions[1].height = 30
+        ws.freeze_panes = "A2"
+        wb.save(self.path)
+
+    def append_row(self, event: CameraDetectionEvent):
+        with self._lock:
+            try:
+                self._detection_count += 1
+                event.detection_num = self._detection_count
+
+                wb = load_workbook(self.path)
+                ws = wb.active
+
+                row_idx     = ws.max_row + 1
+                data_font   = Font(name="Arial", size=10)
+                data_align  = Alignment(horizontal="center", vertical="center")
+                thin_border = Border(
+                    left=Side(style="thin"), right=Side(style="thin"),
+                    top=Side(style="thin"), bottom=Side(style="thin"),
+                )
+                row_fill = PatternFill("solid", start_color="D5E8D4") \
+                    if row_idx % 2 == 0 else PatternFill("solid", start_color="FFFFFF")
+
+                for col_idx, value in enumerate(event.to_excel_row(), start=1):
+                    cell = ws.cell(row=row_idx, column=col_idx, value=value)
+                    cell.font      = data_font
+                    cell.alignment = data_align
+                    cell.border    = thin_border
+                    cell.fill      = row_fill
+
+                wb.save(self.path)
+
+            except Exception as e:
+                log.error(f"Camera Excel write error: {e}")
+
+    def reset(self):
+        with self._lock:
+            if os.path.exists(self.path):
+                os.remove(self.path)
+            self._detection_count = 0
+        self._ensure_file()
+
+
 # ──────────────────────────────────────────────
 #  MAIN CLASS
 # ──────────────────────────────────────────────
@@ -232,6 +347,7 @@ class MissionLogger:
         # label → هل لسه موجود في الـ frame
         self._camera_active:    dict  = {}
         self._camera_count:     int   = 0
+        self._camera_detection_num: int = 0
 
         # ── Obstacle tracking ────────────────────
         self._obstacle_count:         int   = 0
@@ -244,14 +360,18 @@ class MissionLogger:
         # بنطبع رسالة الـ "not connected" مرة واحدة بس
         self._arduino_warning_shown:  bool  = False
 
+        # ── Dirs first, then Excel ────────────────
+        self._setup_dirs()
+
         # ── Excel ────────────────────────────────
         if not EXCEL_AVAILABLE:
             log.warning("openpyxl not installed — Excel logging disabled. "
                         "Run: pip install openpyxl")
         self._excel: Optional[ExcelManager] = \
             ExcelManager(OBSTACLE_EXCEL) if EXCEL_AVAILABLE else None
+        self._camera_excel: Optional[CameraExcelManager] = \
+            CameraExcelManager(CAMERA_EXCEL) if EXCEL_AVAILABLE else None
 
-        self._setup_dirs()
         log.info("MissionLogger v3.0 initialized")
 
     # ──────────────────────────────────────────
@@ -314,7 +434,10 @@ class MissionLogger:
         count = self._count_images(CAMERA_DIR)
         size  = self._dir_size_mb(CAMERA_DIR)
         self._clear_dir_images(CAMERA_DIR)
+        if self._camera_excel:
+            self._camera_excel.reset()
         self._camera_count = 0
+        self._camera_detection_num = 0
         self._camera_last_save.clear()
         self._camera_active.clear()
         log.info(f"Camera log cleared — was {count} images ({size:.1f} MB)")
@@ -416,13 +539,27 @@ class MissionLogger:
             name = f"CAM_{ts}_{label}.jpg"
             path = os.path.join(CAMERA_DIR, name)
 
+            # البيئة الحالية
+            env = self.vision.get_environment()
+            env_label = env.label if env and env.label not in ("", "Unknown") else "Unknown"
+
             if frame is not None:
                 cv2.imwrite(path, frame)
                 self._camera_count += 1
-                log.debug(f"Camera image saved: {name} (total={self._camera_count})")
+                log.debug(f"Camera image saved: {name} | env={env_label} (total={self._camera_count})")
                 self._enforce_camera_limit()
             else:
                 log.debug(f"Camera detection ({label}) — no frame available")
+
+            # Excel — بيتراكم ومش بيتمسح
+            if self._camera_excel:
+                event = CameraDetectionEvent(
+                    label       = label,
+                    timestamp   = timestamp,
+                    image_name  = name if frame is not None else "NO_FRAME",
+                    environment = env_label,
+                )
+                self._camera_excel.append_row(event)
 
         except Exception as e:
             log.error(f"Camera save error: {e}")
