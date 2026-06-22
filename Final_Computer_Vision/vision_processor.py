@@ -386,6 +386,8 @@ class VisionProcessor:
 
         # GStreamer push pipeline to MediaMTX
         self._gst_pipeline = None
+        self._gst_last_retry = 0.0
+        self._GST_RETRY_INTERVAL = 5.0 
 
     # ──────────────────────────────────────────
     #  PUBLIC API
@@ -566,6 +568,14 @@ class VisionProcessor:
     def _push_frame(self, frame: np.ndarray):
         if self._gst_pipeline and self._gst_pipeline.isOpened():
             self._gst_pipeline.write(frame)
+            return
+        now = time.time()
+        if now - self._gst_last_retry >= self._GST_RETRY_INTERVAL:
+            self._gst_last_retry = now
+            log.warning("GStreamer pipeline down — attempting reopen...")
+            if self._gst_pipeline:
+                self._gst_pipeline.release()
+            self._start_gst_push()   # reuses your existing NVENC→x264 fallback logic
 
     # ──────────────────────────────────────────
     #  CAMERA
