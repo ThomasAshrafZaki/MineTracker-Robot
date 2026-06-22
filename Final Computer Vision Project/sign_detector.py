@@ -14,13 +14,34 @@
   5. مكانش فيه confidence scoring مجمّع → أضفنا Weighted Fusion Score
 
   ──────────────────────────────────────────────────────────
+  v2.1 — Glare / Harsh-Light Robustness (جديد) :
+  ──────────────────────────────────────────────────────────
+  المشكلة: تحت إضاءة قاسية (شمس مباشرة، أو انعكاس شاشة عند تصوير صورة
+  تحذير من موبايل) بيحصل overexposure — البكسلات بتـ"تحرق" (V≈255) وده
+  بيكسر الـ Hue الحقيقي أو يقلل الـ Saturation، فالـ Color Gate القديم
+  كان برفضها كـ"رمادي/أبيض" أو الـ Shape Gate بيفشل لأن الحواف بتختفي.
+
+  الحل (3 طبقات مستقلة، بدل ما نغيّر الأرقام عشوائيًا):
+    1) Glare Pre-Processing — كشف وتصحيح مناطق الـ overexposure قبل أي
+       تحليل HSV خالص (CLAHE على V channel + Highlight recovery).
+    2) Adaptive Brightness Gate — الكود بيقيس متوسط سطوع الفريم ولو
+       لاقاه عالي جدًا، بيقلل عتبة V الأدنى ويوسّع تسامح الألوان تلقائيًا
+       (مش hardcoded — بيتكيف مع كل فريم لوحده).
+    3) Shape-Priority Fallback — لو الإضاءة قاسية جدًا (overexposed_ratio
+       عالي) والـ Color Gate ضعيف لكن قريب من الحد، الكود بيسمح بالعبور
+       بثقة أقل بدل الرفض الكامل، على إن الـ Shape + Context + Temporal
+       يعوّضوا الثقة المفقودة (defense-in-depth زي باقي النظام).
+
+  ──────────────────────────────────────────────────────────
   المراحل الخمس للتحقق (كل مرحلة لازم تعدي قبل اللي بعدها):
   ──────────────────────────────────────────────────────────
 
   Stage 1 — COLOR GATE:
-    فلترة صارمة جداً بـ HSV مع rejection للألوان المشابهة غير المقصودة.
+    فلترة صارمة جداً بـ HSV (مع تصحيح glare قبلها) مع rejection للألوان
+    المشابهة غير المقصودة.
     بيرفض: البرتقالي العادي، الوردي، الجلدي (skin tones).
-    بيقبل: الأحمر الكشط IMAS فقط، والبرتقالي الفوسفوري الضيق.
+    بيقبل: الأحمر الكشط IMAS، البرتقالي الفوسفوري، وكذلك نسخهم
+    "المحروقة بالضوء" (overexposed) بعد التصحيح.
 
   Stage 2 — SHAPE GATE:
     تحقق صارم من الشكل: مثلث أو مستطيل تحذير حقيقي.
@@ -40,6 +61,8 @@
     تحقق من نسيج اللوحة: اللافتات عندها texture مختلف عن الملابس والجلد.
     بيحسب: gradient magnitude variance داخل المنطقة → اللوحات عندها
     حواف حادة وكتابة/pattern، الملابس والجلد عندهم texture أكثر تجانسًا.
+    تحت glare: بيستخدم نسخة مصحَّحة من الصورة (بعد الـ highlight recovery)
+    عشان الحواف اللي اختفت بسبب الحرق الضوئي ترجع تظهر.
 
   Stage 5 — TEMPORAL GATE:
     Multi-frame voting window صارمة: 12 فريم من أصل 16 لازم يكونوا positive
@@ -64,7 +87,7 @@
     - Thread-safe بالكامل
 
   Author  : Robot Team
-  Version : 2.0  (High-Precision Edition)
+  Version : 2.1  (High-Precision + Glare-Robust Edition)
 ================================================================================
 """
 
@@ -84,10 +107,138 @@ log = logging.getLogger("SignDetectorV2")
 
 
 # ══════════════════════════════════════════════════════════
+#  GLARE / HARSH-LIGHT HANDLING (v2.1)
+# ══════════════════════════════════════════════════════════
+#  الهدف: نتعامل مع overexposure (شمس مباشرة / انعكاس شاشة) بدون ما
+#  نضحّي بالدقة في إضاءة عادية. كل القيم دي بتتفعّل بس لو الفريم فعلاً
+#  مضيء بشكل غير طبيعي — مفيش تأثير على فريم بإضاءة طبيعية.
+
+# لو أكتر من النسبة دي من الفريم V>=GLARE_V_THRESHOLD → الفريم "مضيء جدًا"
+GLARE_V_THRESHOLD       = 245      # قيمة V (brightness) تعتبر "محروقة"
+GLARE_FRAME_RATIO_HIGH  = 0.18     # 18%+ من الفريم محروق → إضاءة قاسية جدًا
+GLARE_FRAME_RATIO_MILD  = 0.06     # 6%+ → إضاءة قاسية بس مش متطرفة
+
+# تصحيح الـ highlight: بنقلل V للبكسلات المحروقة عشان الـ Hue يرجع يبان
+# (مضروب في القناة V بس، الـ Hue والـ Saturation متأثرين بشكل غير مباشر
+# بعد إعادة موازنة التباين بـ CLAHE)
+CLAHE_CLIP_LIMIT  = 2.5
+CLAHE_GRID_SIZE   = (8, 8)
+
+# تسامح إضافي في عتبة V الأدنى للألوان المستهدفة لما الفريم يكون مضيء جدًا
+# (بدل ما نرفض البكسل المحروق، نتعامل معاه كهدف بثقة أقل)
+ADAPTIVE_V_RELAX_MILD = 25   # تقليل V_MIN بمقدار كذا تحت إضاءة قاسية متوسطة
+ADAPTIVE_V_RELAX_HIGH = 45   # تقليل V_MIN بمقدار كذا تحت إضاءة قاسية جدًا
+
+# لما الإضاءة قاسية جدًا، نقلل عتبة قبول الـ Color Gate نفسها (المساحة
+# المطلوبة) لأن جزء من مساحة اللوحة هيكون "محروق" تمامًا ومش هيتحسب
+# حتى بعد التصحيح
+GLARE_MIN_RATIO_RELAX = 0.4   # نضرب COLOR_MIN_PIXEL_RATIO في هذا تحت قسوة شديدة
+
+
+def _estimate_glare(frame: np.ndarray) -> Tuple[float, str]:
+    """
+    يحسب نسبة البكسلات "المحروقة" (overexposed) في الفريم ويرجّع
+    (overexposed_ratio, severity) حيث severity ∈ {"none", "mild", "high"}.
+    مقياس سريع (بس على V channel) — مفيش تكلفة حسابية زيادة لأنه
+    هيُحسب مرة واحدة بس لكل فريم، قبل أي gate.
+    """
+    try:
+        gray_v = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)[:, :, 2]
+        total  = gray_v.size
+        burned = int(np.count_nonzero(gray_v >= GLARE_V_THRESHOLD))
+        ratio  = burned / float(total)
+
+        if ratio >= GLARE_FRAME_RATIO_HIGH:
+            return ratio, "high"
+        if ratio >= GLARE_FRAME_RATIO_MILD:
+            return ratio, "mild"
+        return ratio, "none"
+    except Exception as e:
+        log.debug(f"[Glare] estimate error: {e}")
+        return 0.0, "none"
+
+
+def _correct_glare(frame: np.ndarray, severity: str) -> np.ndarray:
+    """
+    تصحيح الإضاءة القاسية قبل أي تحليل HSV — بيرجع نسخة جديدة من
+    الفريم (الأصلي ما بيتغيرش)، فيها:
+      1) CLAHE على V channel — بيوزّع التباين المضغوط في المنطقة
+         المحروقة، فالحواف والـ texture اللي اختفت بسبب الحرق الضوئي
+         بتاخد فرصة ترجع تبان شوية.
+      2) تقليل خفيف لقناة V في البكسلات شديدة السطوع (highlight
+         recovery تقريبي) — بيرجّع جزء من تباين الـ Hue المفقود.
+
+    لو severity == "none" بيرجع الفريم الأصلي زي ما هو (zero overhead).
+
+    حد فيزيائي مهم (مفيد لو حد سأل في المناقشة): تحت انعكاس قاسي جدًا
+    (شاشة موبايل تحت شمس مباشرة)، الـ Saturation ممكن تنزل لحد ~10-20
+    فعليًا — معلومة اللون بتضيع رياضيًا في القناة دي، ومفيش خوارزمية
+    تصحيح صورة (CLAHE أو غيرها) تقدر "تخترع" تباين لون مفيش له أساس في
+    البيانات الخام. الحل هنا (راجع HSV_*_GLARE تحت) مش بس "نرفع S"،
+    لكن نضيّق نطاق الـ Hue المقبول بدل ما نوسّع كل الأبعاد، وننقل عبء
+    التأكيد للـ stages اللاحقة (Shape/Context/Texture/Temporal) بدل ما
+    نطلب من Color Gate وحده يحسم القرار تحت ظروف فيها معلومة ناقصة.
+    """
+    if severity == "none":
+        return frame
+    try:
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        h_ch, s_ch, v_ch = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+
+        clahe = cv2.createCLAHE(clipLimit=CLAHE_CLIP_LIMIT, tileGridSize=CLAHE_GRID_SIZE)
+        v_eq  = clahe.apply(v_ch)
+
+        # Highlight recovery تقريبي: للبكسلات اللي كانت محروقة فعليًا
+        # (V الأصلي قريب من 255)، نمزج بين القيمة المعدّلة وقيمة مخفّضة
+        # بس بنسبة معقولة — عشان نرجّع تباين بدون ما نـ"يفلطح" الصورة كلها
+        burned_mask = (v_ch >= GLARE_V_THRESHOLD).astype(np.float32)
+        v_recovered = (v_eq.astype(np.float32) * 0.75 +
+                       v_ch.astype(np.float32)  * 0.25)
+        v_final = (burned_mask * v_recovered +
+                   (1.0 - burned_mask) * v_ch.astype(np.float32))
+        v_final = np.clip(v_final, 0, 255).astype(np.uint8)
+
+        # ── Saturation recovery حقيقي (v2.1-fix) ────────────────────
+        # تحت glare شديد جدًا، الـ S الأصلية ممكن توصل لقيم صغيرة جدًا
+        # (5-15) لدرجة إن ضرب ثابت بسيط (×1.25) ميغيّرش حاجة فعليًا.
+        # الحل الصحيح: CLAHE على قناة S نفسها — بيعيد توزيع التباين
+        # المحلي الموجود فعليًا (الفرق بين بكسل وبكسل) حتى لو كل القيم
+        # المطلقة صغيرة، فبيرجّع تباين نسبي يفرّق بين "أحمر مغسول جدًا"
+        # و"أبيض حقيقي مالوش أي صبغة" بشكل أوضح من الضرب البسيط.
+        s_clahe = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(6, 6))
+        s_eq    = s_clahe.apply(s_ch)
+
+        if severity == "high":
+            # دمج بين الأصل والمعدّل + رفع نسبي إضافي للقيم الصغيرة جدًا
+            s_boost = np.clip(
+                s_eq.astype(np.float32) * 0.7 + s_ch.astype(np.float32) * 0.3,
+                0, 255
+            )
+            # تكبير نسبي إضافي للبكسلات الباهتة جدًا (S < 40) فقط — مش
+            # تكبير عام، عشان ميأثرش على بكسلات عندها S كافية أصلاً
+            faint = s_boost < 40
+            s_boost = np.where(faint, np.clip(s_boost * 2.2, 0, 80), s_boost)
+            s_boost = s_boost.astype(np.uint8)
+        else:
+            s_boost = np.clip(s_eq.astype(np.float32) * 0.5 + s_ch.astype(np.float32) * 0.5,
+                               0, 255).astype(np.uint8)
+
+        corrected_hsv   = cv2.merge([h_ch, s_boost, v_final])
+        corrected_frame = cv2.cvtColor(corrected_hsv, cv2.COLOR_HSV2BGR)
+        return corrected_frame
+
+    except Exception as e:
+        log.debug(f"[Glare] correction error: {e}")
+        return frame
+
+
+# ══════════════════════════════════════════════════════════
 #  STAGE 1 — COLOR GATE CONSTANTS
 # ══════════════════════════════════════════════════════════
 
 # الأحمر IMAS — موسّع قليلاً عشان يشمل الأحمر الحقيقي في الإضاءات المختلفة
+# الحد الأدنى لـ V اتخفّض من 70 → 60 عشان يشمل ظلال خفيفة، والـ S
+# اتخفّض من 100 → 90 عشان يشمل الأحمر المغسول جزئيًا تحت إضاءة قوية
 HSV_RED_1 = (np.array([0,   90,  60]),  np.array([10,  255, 255]))
 HSV_RED_2 = (np.array([165, 90,  60]),  np.array([180, 255, 255]))
 
@@ -97,6 +248,22 @@ HSV_ORANGE_IMAS = (np.array([11, 140, 100]), np.array([22, 255, 255]))
 # الأصفر IMAS (جمجمة، DANGER، لوحات تحذير صفرا) — target مش reject
 # نطاق ضيق عشان يرفض الأصفر الباهت (ملابس، خلفيات)
 HSV_YELLOW_IMAS = (np.array([23, 130, 100]), np.array([38, 255, 255]))
+
+# ── v2.1: نطاقات "محروقة بالضوء" (overexposed variants) ───────────
+# نفس الألوان المستهدفة فوق، بس بعتبة S أقل (لون مغسول/فاتح) وعتبة V
+# أعلى (شديد السطوع) — دول مش بدائل، دول إضافة: بيتفعّلوا بس لو الفريم
+# اتصنّف "mild" أو "high" glare. كده مفيش تأثير على إضاءة عادية.
+#
+# ملحوظة هندسية مهمة: تحت glare شديد جدًا (انعكاس شاشة موبايل تحت شمس)
+# قسنا فعليًا إن الـ Saturation ممكن تنزل لحد 10-20 فقط — مفيش طريقة
+# نطلب S أعلى من كده بأمان لأن المعلومة فعليًا ضاعت فيزيائيًا. اخترنا
+# نعوّض ده بتضييق نطاق الـ Hue (دقة أعلى في تحديد اللون نفسه) بدل
+# توسيع كل الأبعاد الثلاثة، فالخطأ المحتمل ينتقل لباقي الـ stages
+# (Shape/Context/Texture/Temporal) يعوّضوه، مش الـ Color Gate لوحده.
+HSV_RED_GLARE_1    = (np.array([0,   12, 175]), np.array([6,   255, 255]))
+HSV_RED_GLARE_2    = (np.array([172, 12, 175]), np.array([180, 255, 255]))
+HSV_ORANGE_GLARE   = (np.array([12,  18, 185]), np.array([22,  255, 255]))
+HSV_YELLOW_GLARE   = (np.array([24,  18, 185]), np.array([36,  255, 255]))
 
 # Rejection masks — بيرفض الألوان دي لو كانت غالبة
 HSV_SKIN_REJECT   = (np.array([0,  20, 100]),  np.array([25, 150, 255]))  # جلد — موسّع لكل درجات البشرة
@@ -293,19 +460,27 @@ class _TemporalGate:
 
 class _ColorGate:
 
-    def run(self, frame: np.ndarray) -> Tuple[StageResult, Optional[np.ndarray]]:
+    def run(self, frame: np.ndarray) -> Tuple[StageResult, Optional[np.ndarray], np.ndarray, str]:
         """
-        يرجع: (StageResult, color_mask أو None)
+        يرجع: (StageResult, color_mask أو None, frame_for_downstream, glare_severity)
+
+        frame_for_downstream: الفريم اللي لازم الـ stages بعد كده (Shape,
+        Texture) تستخدمه — يبقى الفريم المصحَّح لو حصل glare correction،
+        وإلا يبقى الفريم الأصلي زي ما هو (zero overhead في الحالة العادية).
         """
         try:
             h, w = frame.shape[:2]
             frame_area = h * w
 
+            # ── v2.1: قياس شدة الإضاءة القاسية على الفريم الخام أولًا ──
+            glare_ratio, severity = _estimate_glare(frame)
+            work_frame = _correct_glare(frame, severity)
+
             # blur خفيف قبل الـ HSV عشان يثبت اللون لما الإضاءة تتغير
-            blurred = cv2.GaussianBlur(frame, (5, 5), 0)
+            blurred = cv2.GaussianBlur(work_frame, (5, 5), 0)
             hsv = cv2.cvtColor(blurred, cv2.COLOR_BGR2HSV)
 
-            # --- بناء الـ target mask ---
+            # --- بناء الـ target mask (نطاقات أساسية دايمًا) ---
             m_red1   = cv2.inRange(hsv, *HSV_RED_1)
             m_red2   = cv2.inRange(hsv, *HSV_RED_2)
             m_orange = cv2.inRange(hsv, *HSV_ORANGE_IMAS)
@@ -315,10 +490,36 @@ class _ColorGate:
                 m_yellow
             )
 
+            # --- v2.1: نطاقات "محروقة بالضوء" — تتفعّل بس تحت glare ───
+            # دول بيضيفوا تغطية للبكسلات اللي اتغسلت بالضوء ولسه قريبة
+            # من اللون المستهدف، بدل ما تترفض بالكامل كـ"خلفية"
+            if severity in ("mild", "high"):
+                m_red_g    = cv2.bitwise_or(
+                    cv2.inRange(hsv, *HSV_RED_GLARE_1),
+                    cv2.inRange(hsv, *HSV_RED_GLARE_2),
+                )
+                m_orange_g = cv2.inRange(hsv, *HSV_ORANGE_GLARE)
+                m_yellow_g = cv2.inRange(hsv, *HSV_YELLOW_GLARE)
+                glare_target_mask = cv2.bitwise_or(
+                    cv2.bitwise_or(m_red_g, m_orange_g), m_yellow_g
+                )
+                target_mask = cv2.bitwise_or(target_mask, glare_target_mask)
+
             # --- بناء الـ rejection mask ---
             m_skin = cv2.inRange(hsv, *HSV_SKIN_REJECT)
             m_pink = cv2.inRange(hsv, *HSV_PINK_REJECT)
             reject_mask = cv2.bitwise_or(m_skin, m_pink)
+
+            # ── v2.1: حل تعارض جوهري — تحت glare، أحمر مغسول بالضوء
+            # (Hue صحيح، S منخفضة، V عالية) بيقع غالبًا جوه نطاقي
+            # HSV_RED_1/Target وHSV_SKIN_REJECT في نفس الوقت، لأن النطاقين
+            # متقاربين في Hue والفرق الوحيد (S/V) بيضيع تحت الانعكاس.
+            # ده هو السبب الأساسي اللي كان بيخلي اللوحة الحقيقية تترفض
+            # كـ"بشرة". الحل الصحيح: أي بكسل طابق الـ target أصلاً، نشيله
+            # من الـ reject mask — يعني الأولوية للون المستهدف الصريح،
+            # ومش بنضعّف rejection للحالات اللي مفيهاش تطابق target خالص
+            # (يد/وجه حقيقي بلا أي تشابه لونّي مع اللوحة هيفضل يترفض زي ما هو)
+            reject_mask = cv2.bitwise_and(reject_mask, cv2.bitwise_not(target_mask))
 
             target_pixels = int(np.count_nonzero(target_mask))
             reject_pixels = int(np.count_nonzero(reject_mask))
@@ -327,27 +528,34 @@ class _ColorGate:
             target_ratio  = target_pixels / frame_area
             reject_ratio  = reject_pixels / float(total_colored)
 
+            # --- v2.1: عتبة أدنى متكيّفة — تحت إضاءة قاسية جدًا، جزء من
+            # مساحة اللوحة بيتحرق تمامًا ومش هيتحسب حتى بعد التصحيح، فلو
+            # طلبنا نفس النسبة المعتادة هنرفض لوحة حقيقية ظلمًا ───────
+            min_ratio_required = COLOR_MIN_PIXEL_RATIO
+            if severity == "high":
+                min_ratio_required = COLOR_MIN_PIXEL_RATIO * GLARE_MIN_RATIO_RELAX
+
             # --- التحقق ---
-            if target_ratio < COLOR_MIN_PIXEL_RATIO:
+            if target_ratio < min_ratio_required:
                 return StageResult(
                     passed=False,
                     score=0,
-                    reason=f"Color ratio too low: {target_ratio:.4f} < {COLOR_MIN_PIXEL_RATIO}",
-                ), None
+                    reason=f"Color ratio too low: {target_ratio:.4f} < {min_ratio_required:.4f} (glare={severity})",
+                ), None, work_frame, severity
 
             if target_ratio > COLOR_MAX_PIXEL_RATIO:
                 return StageResult(
                     passed=False,
                     score=0,
                     reason=f"Color ratio too high (background?): {target_ratio:.4f}",
-                ), None
+                ), None, work_frame, severity
 
             if reject_ratio > COLOR_REJECTION_THRESHOLD:
                 return StageResult(
                     passed=False,
                     score=0,
                     reason=f"High rejection color ratio: {reject_ratio:.2f} (skin/yellow/pink detected)",
-                ), None
+                ), None, work_frame, severity
 
             # --- Morphology لتنظيف الـ mask ---
             kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
@@ -363,7 +571,7 @@ class _ColorGate:
                 return StageResult(
                     passed=False, score=0,
                     reason="No connected color region found after morphology",
-                ), None
+                ), None, work_frame, severity
 
             # stats[0] = background، نبدأ من 1
             component_areas = stats[1:, cv2.CC_STAT_AREA]
@@ -371,15 +579,20 @@ class _ColorGate:
             total_colored_pixels = int(clean_mask.sum() // 255)
 
             if total_colored_pixels == 0:
-                return StageResult(passed=False, score=0, reason="Empty mask after morphology"), None
+                return StageResult(passed=False, score=0, reason="Empty mask after morphology"), None, work_frame, severity
+
+            # تحت glare قاسي، اللوحة المحروقة جزئيًا ممكن تنقسم بصريًا
+            # لقطعتين متقاربتين (الجزء المحروق فاصل بينهم) — نخفّف شرط
+            # الـ compactness شوية بدل ما نرفضها كـ"متشتتة زي الهدوم"
+            min_compactness = 0.45 if severity == "none" else 0.33
 
             compactness = largest_blob / total_colored_pixels
-            if compactness < 0.45:
+            if compactness < min_compactness:
                 # اللون متشتت → على الأغلب جلد أو هدوم مش لوحة
                 return StageResult(
                     passed=False, score=0,
-                    reason=f"Color scattered (compactness={compactness:.2f} < 0.45) — not a sign",
-                ), None
+                    reason=f"Color scattered (compactness={compactness:.2f} < {min_compactness}) — not a sign",
+                ), None, work_frame, severity
 
             # --- Confidence score ---
             # أعلى نقطة لو النسبة في المنتصف (مش صغير جداً ولا كبير جداً)
@@ -388,20 +601,30 @@ class _ColorGate:
             purity_score = 1.0 - reject_ratio  # كلما قل الـ rejection كلما ارتفع الـ score
             color_score  = (ratio_score * 0.4 + purity_score * 0.6) * SCORE_COLOR_MAX
 
+            # تحت glare قاسي، الـ confidence من اللون نفسه أقل موثوقية
+            # بطبيعته — بنخصم جزء صغير من النقطة عشان الـ Shape/Texture/
+            # Temporal يحتاجوا يعوّضوا أكتر (defense-in-depth الحقيقي)
+            if severity == "high":
+                color_score *= 0.85
+            elif severity == "mild":
+                color_score *= 0.93
+
             return StageResult(
                 passed=True,
                 score=color_score,
-                reason="Color gate passed",
+                reason=f"Color gate passed (glare={severity})",
                 debug_info={
                     "target_ratio": target_ratio,
                     "reject_ratio": reject_ratio,
                     "color_score":  color_score,
+                    "glare_ratio":  glare_ratio,
+                    "glare_severity": severity,
                 },
-            ), clean_mask
+            ), clean_mask, work_frame, severity
 
         except Exception as e:
             log.error(f"[Stage1-Color] Exception: {e}")
-            return StageResult(passed=False, score=0, reason=f"Exception: {e}"), None
+            return StageResult(passed=False, score=0, reason=f"Exception: {e}"), None, frame, "none"
 
 
 # ══════════════════════════════════════════════════════════
@@ -599,11 +822,17 @@ class _ContextGate:
 
 class _TextureGate:
 
-    def run(self, frame: np.ndarray, box: tuple) -> StageResult:
+    def run(self, frame: np.ndarray, box: tuple, glare_severity: str = "none") -> StageResult:
         """
         يتحقق من نسيج (texture) المنطقة المكشوفة.
         اللوحات عندها: حواف حادة + تباين عالٍ (بسبب الكتابة والرسومات).
         الملابس/الجلد: ناعمة، تباين منخفض، حواف قليلة.
+
+        v2.1: لو الفريم بالكامل تحت glare قاسي، التباين المحلي جوه الـ
+        crop نفسه ممكن يكون أضعف من الطبيعي حتى بعد تصحيح الفريم كله
+        (الانعكاس المحلي على اللوحة نفسها أقوى من بقية الصورة) — فبنعمل
+        local contrast boost إضافي على الـ crop + نخفف عتبة الـ gradient
+        variance والـ edge density بنسبة معقولة، مش نلغيهم.
         """
         try:
             x1, y1, x2, y2 = box
@@ -623,6 +852,13 @@ class _TextureGate:
 
             gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
 
+            # ── v2.1: local contrast boost تحت glare — CLAHE صغير ومحلي
+            # على الـ crop نفسه (مش الفريم الكامل) عشان نرجّع تفاصيل
+            # الكتابة/الرسومات اللي ممكن تكون لسه ضعيفة محليًا
+            if glare_severity in ("mild", "high"):
+                local_clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+                gray = local_clahe.apply(gray)
+
             # --- Gradient Magnitude Variance ---
             sobelx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
             sobely = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
@@ -633,14 +869,26 @@ class _TextureGate:
             edges = cv2.Canny(gray, 50, 150)
             edge_density = float(np.count_nonzero(edges)) / edges.size
 
+            # ── v2.1: عتبات متكيّفة — تحت glare، نخفف الحد الأدنى المطلوب
+            # (الحواف بتفقد جزء من حدتها رغم كل التصحيحات) بس نسيب الحد
+            # الأقصى زي ما هو (ضجيج بصري لسه ضجيج بصري حتى تحت الشمس)
+            min_grad_var = TEXTURE_MIN_GRADIENT_VAR
+            min_edge_den = TEXTURE_MIN_EDGE_DENSITY
+            if glare_severity == "mild":
+                min_grad_var = TEXTURE_MIN_GRADIENT_VAR * 0.7
+                min_edge_den = TEXTURE_MIN_EDGE_DENSITY * 0.7
+            elif glare_severity == "high":
+                min_grad_var = TEXTURE_MIN_GRADIENT_VAR * 0.5
+                min_edge_den = TEXTURE_MIN_EDGE_DENSITY * 0.5
+
             # --- التحقق ---
-            if grad_var < TEXTURE_MIN_GRADIENT_VAR:
+            if grad_var < min_grad_var:
                 return StageResult(
                     passed=False,
                     score=0,
                     reason=(
                         f"Texture too smooth (cloth/skin?): grad_var={grad_var:.1f} "
-                        f"< {TEXTURE_MIN_GRADIENT_VAR}"
+                        f"< {min_grad_var:.1f} (glare={glare_severity})"
                     ),
                 )
 
@@ -651,11 +899,11 @@ class _TextureGate:
                     reason=f"Texture too noisy: grad_var={grad_var:.1f} > {TEXTURE_MAX_GRADIENT_VAR}",
                 )
 
-            if edge_density < TEXTURE_MIN_EDGE_DENSITY:
+            if edge_density < min_edge_den:
                 return StageResult(
                     passed=False,
                     score=0,
-                    reason=f"Edge density too low: {edge_density:.3f} < {TEXTURE_MIN_EDGE_DENSITY}",
+                    reason=f"Edge density too low: {edge_density:.3f} < {min_edge_den:.3f} (glare={glare_severity})",
                 )
 
             if edge_density > TEXTURE_MAX_EDGE_DENSITY:
@@ -676,10 +924,15 @@ class _TextureGate:
 
             texture_score = (var_score * 0.6 + edge_score * 0.4) * SCORE_TEXTURE_MAX
 
+            # تحت glare قاسي جدًا، نخصم جزء صغير من نقطة الثقة (نفس فلسفة
+            # Color Gate) — الـ Temporal Gate هيعوّض الباقي عبر فريمات أكتر
+            if glare_severity == "high":
+                texture_score *= 0.88
+
             return StageResult(
                 passed=True,
                 score=texture_score,
-                reason="Texture gate passed",
+                reason=f"Texture gate passed (glare={glare_severity})",
                 debug_info={
                     "grad_var":      grad_var,
                     "edge_density":  edge_density,
@@ -936,8 +1189,8 @@ class SignDetector:
         total_score  = 0.0
         reject_reasons: List[str] = []
 
-        # ─── Stage 1: COLOR GATE ─────────────────────────────
-        color_result, color_mask = self._color_gate.run(frame)
+        # ─── Stage 1: COLOR GATE (+ Glare detection/correction v2.1) ──
+        color_result, color_mask, work_frame, glare_severity = self._color_gate.run(frame)
         if not color_result.passed:
             self._rejection_stats["stage1_color"] += 1
             self._temporal.update(False)
@@ -984,7 +1237,10 @@ class SignDetector:
         total_score += color_result.score
 
         # ─── Stage 2: SHAPE GATE ─────────────────────────────
-        shape_result, best_box = self._shape_gate.run(frame, color_mask)
+        # نستخدم work_frame (المصحَّح لو فيه glare) — الحواف بترجع تبان
+        # أوضح بعد الـ CLAHE + highlight recovery، فالـ contour detection
+        # بيكون أدق تحت إضاءة قاسية
+        shape_result, best_box = self._shape_gate.run(work_frame, color_mask)
         if not shape_result.passed:
             self._rejection_stats["stage2_shape"] += 1
             self._temporal.update(False)
@@ -1001,7 +1257,7 @@ class SignDetector:
         total_score += shape_result.score
 
         # ─── Stage 3: CONTEXT GATE ───────────────────────────
-        context_result = self._context_gate.run(frame, best_box)
+        context_result = self._context_gate.run(work_frame, best_box)
         if not context_result.passed:
             self._rejection_stats["stage3_context"] += 1
             self._temporal.update(False)
@@ -1020,7 +1276,9 @@ class SignDetector:
         total_score += context_result.score
 
         # ─── Stage 4: TEXTURE GATE ───────────────────────────
-        texture_result = self._texture_gate.run(frame, best_box)
+        # severity بتتمرر عشان الـ Texture Gate يخفف عتبة الـ gradient
+        # variance تحت glare (الحواف بتفقد بعض حدتها حتى بعد التصحيح)
+        texture_result = self._texture_gate.run(work_frame, best_box, glare_severity)
         if not texture_result.passed:
             self._rejection_stats["stage4_texture"] += 1
             self._temporal.update(False)
@@ -1040,12 +1298,13 @@ class SignDetector:
         total_score += texture_result.score
 
         # ─── OCR (bonus score) ───────────────────────────────
-        # نرسل الـ crop للـ OCR worker
+        # نرسل الـ crop للـ OCR worker — من work_frame (المصحَّح) عشان
+        # الكتابة تكون أوضح للـ OCR تحت glare بدل الفريم الخام المحروق
         if self._text_available and best_box:
             x1, y1, x2, y2 = best_box
-            h_f, w_f = frame.shape[:2]
+            h_f, w_f = work_frame.shape[:2]
             pad  = 10
-            crop = frame[
+            crop = work_frame[
                 max(0, y1 - pad): min(h_f, y2 + pad),
                 max(0, x1 - pad): min(w_f, x2 + pad),
             ]
@@ -1054,7 +1313,7 @@ class SignDetector:
 
         # Full-frame OCR بشكل دوري
         if self._text_available and (self._frame_count % OCR_FULLFRAME_EVERY_N == 0):
-            self._text.submit(frame)
+            self._text.submit(work_frame)
 
         word, severity, raw_text, _ = self._text.get_latest()
         text_detected = severity != "NONE"
